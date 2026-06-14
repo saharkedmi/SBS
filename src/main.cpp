@@ -43,10 +43,10 @@
 #define SERVO_CR_LOCK    6553   // 2.0ms — סיבוב לכיוון נעילה
 // אם הנעל מסתובבת לכיוון ההפוך — פשוט החלף את ערכי UNLOCK ו-LOCK
 #define SERVO_MOVE_MS    850    // כוונן: מספיק ms עד שהתפס נועל/נפתח לגמרי
-#define SLEEP_TIMEOUT_MS    60000
+#define SLEEP_TIMEOUT_MS    120000  // 2 דקות ב-IDLE לפני שינה עמוקה
 
-// דיווח MQTT אחת לשעה (deep-sleep timer)
-#define REPORT_INTERVAL_US      (3600ULL * 1000000ULL)
+// Wake-up timer לשינה עמוקה
+#define REPORT_INTERVAL_US      (30ULL * 60ULL * 1000000ULL)  // Wake כל 30 דקות לדיגום
 #define WIFI_CONNECT_TIMEOUT_MS 10000
 
 // מדידת סוללה
@@ -59,10 +59,10 @@
 // הגדרות רשת
 // =====================================================================
 // רשתות WiFi — WiFiMulti מתחבר לחזקה שזמינה
-const char* ssid         = "YOUR_WIFI_SSID";
-const char* password     = "YOUR_WIFI_PASSWORD";
-const char* ssid2        = "YOUR_WIFI_SSID_2";
-const char* password2    = "YOUR_WIFI_PASSWORD_2";
+//const char* ssid         = "YOUR_WIFI_SSID";
+//const char* password     = "YOUR_WIFI_PASSWORD";
+const char* ssid         = "YOUR_WIFI_SSID_2";
+const char* password     = "YOUR_WIFI_PASSWORD_2";
 const char* www_username = "admin";
 const char* www_password = "YOUR_WEB_PASSWORD";
 const char* api_token    = "YOUR_API_TOKEN";
@@ -101,6 +101,7 @@ RTC_DATA_ATTR SensorRecord rtcBuffer[RTC_BUFFER_SIZE];
 RTC_DATA_ATTR uint8_t      rtcHead       = 0;
 RTC_DATA_ATTR uint8_t      rtcCount      = 0;
 RTC_DATA_ATTR uint32_t     bootCount     = 0;
+RTC_DATA_ATTR bool         firstBootCalib = true;  // false אחרי כיול ראשון, שורד שינה עמוקה
 
 void rtcAddRecord(float t, float h, uint8_t bat, uint8_t lockSt,
                   uint8_t evType, uint32_t cardCode = 0) {
@@ -867,9 +868,8 @@ void setSystemState(SystemState newState) {
     activityTimer = millis();
     if (newState == IDLE) {
         digitalWrite(BOOST_12V_EN_PIN, LOW);
-        static bool firstBoot = true;
-        if (firstBoot) {
-            firstBoot = false;
+        if (firstBootCalib) {
+            firstBootCalib = false;
             Serial.println("[INIT] Startup calibration: opening...");
             ledcWrite(SERVO_CH, servoUnlockDuty);
             delay(servoMoveMs);
@@ -1142,7 +1142,6 @@ void setup() {
         // נסה WiFi + MQTT
         WiFi.mode(WIFI_STA);
         wifiMulti.addAP(ssid,  password);
-        wifiMulti.addAP(ssid2, password2);
         unsigned long wStart = millis();
         while (wifiMulti.run() != WL_CONNECTED && millis() - wStart < WIFI_CONNECT_TIMEOUT_MS)
             delay(200);
@@ -1164,8 +1163,10 @@ void setup() {
             Serial.println("[WiFi] Timeout — data buffered for next wake");
         }
 
-        // שינה מושבתת — ממשיך לאתחול רגיל במקום לחזור לשינה
-        Serial.println("[SYS] Sleep disabled — continuing to normal boot");
+        Serial.println("[SYS] Timer wake done — returning to deep sleep");
+        esp_sleep_enable_ext0_wakeup(GPIO_NUM_32, 1);
+        esp_sleep_enable_timer_wakeup(REPORT_INTERVAL_US);
+        esp_deep_sleep_start();
     }
 
     // ── Touch Wake / Boot: פעולה רגילה ──────────────────────────────
@@ -1195,7 +1196,6 @@ void setup() {
 
     WiFi.mode(WIFI_STA);
     wifiMulti.addAP(ssid,  password);
-    wifiMulti.addAP(ssid2, password2);
     for (int i = 0; i < 20 && wifiMulti.run() != WL_CONNECTED; i++) delay(500);
 
     if (WiFi.status() == WL_CONNECTED) {
@@ -1220,15 +1220,12 @@ void setup() {
     activityTimer = millis();
 
     if (wakeReason == WAKE_TOUCH) {
-        addLog("התעוררות ממגע");
-        Serial.println("[SYS] Wake from Deep Sleep (GPIO32)");
-        setSystemState(READER_ACTIVE);
+        addLog("התעוררות ממגע — IDLE");
+        Serial.println("[SYS] Wake from touch — returning to IDLE");
     } else {
         addLog("מערכת הופעלה");
         Serial.println("[SYS] Boot Complete");
     }
-
-    // שינה מושבתת
 }
 
 // =====================================================================
@@ -1357,7 +1354,16 @@ void loop() {
             mqttPublishState(cachedTemp, cachedHum, getBatteryPct(), true);
     }
 
-    // Deep sleep — מושבת
+    // כניסה לשינה עמוקה אחרי 2 דקות ב-IDLE
+    if (currentState == IDLE && millis() - activityTimer > SLEEP_TIMEOUT_MS) {
+        addLog("כניסה לשינה (2 דק' ב-IDLE)");
+        Serial.println("[SYS] No activity — entering deep sleep");
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+        esp_sleep_enable_ext0_wakeup(GPIO_NUM_32, 1);
+        esp_sleep_enable_timer_wakeup(REPORT_INTERVAL_US);
+        esp_deep_sleep_start();
+    }
 
     yield();
 }

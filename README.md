@@ -12,7 +12,7 @@
 - [Wiring Diagram](#wiring-diagram)
 - [Software Stack](#software-stack)
 - [Configuration](#configuration)
-- [Web Dashboard](#web-dashboard)
+- [Web Interface](#web-interface)
 - [REST API](#rest-api)
 - [MQTT / Home Assistant Integration](#mqtt--home-assistant-integration)
 - [State Machine](#state-machine)
@@ -25,7 +25,9 @@
 
 ## Overview
 
-SmartSafe Pro turns an ESP32 into a full-featured electronic safe controller. It reads **Wiegand 26-bit RFID cards**, serves a **Hebrew-language web dashboard** over Wi-Fi, publishes sensor and access events to **Home Assistant via MQTT autodiscovery**, and aggressively conserves battery with **ESP32 deep sleep** — waking on touch or on a 1-hour timer.
+SmartSafe Pro turns an ESP32 into a full-featured electronic safe controller. It reads **Wiegand 26-bit RFID cards**, serves a **Hebrew-language web interface** over Wi-Fi, publishes sensor and access events to **Home Assistant via MQTT autodiscovery**, and conserves battery with **ESP32 deep sleep** — waking on touch or on a 30-minute timer.
+
+The lock mechanism uses an **SG90 continuous-rotation servo** driven by timed PWM bursts. The servo latches the lock open or closed mechanically, and the PWM signal is cut immediately after movement so the motor draws no holding current.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -33,8 +35,8 @@ SmartSafe Pro turns an ESP32 into a full-featured electronic safe controller. It
 │                                                             │
 │  RFID Reader ─────── Wiegand D0/D1 (GPIO 5 / 13)          │
 │  Touch Button ─────── GPIO 32 (EXT0 wake source)           │
-│  12 V Boost Enable ── GPIO 14                               │
-│  Lock SSR ──────────── GPIO 25                              │
+│  12 V Boost Enable ── GPIO 14  (powers RFID reader)        │
+│  Servo Signal ──────── GPIO 25  (50 Hz PWM)                │
 │  DHT11 ─────────────── GPIO 4                               │
 │  Battery ADC ────────── GPIO 35 (voltage divider ÷2)       │
 │  LED Red / Green ──── GPIO 19 / 18                         │
@@ -54,10 +56,14 @@ SmartSafe Pro turns an ESP32 into a full-featured electronic safe controller. It
 | **Edit mode** | Present master card to toggle registration/deletion of other cards |
 | **Remote unlock** | Authenticated HTTP GET with API token; 2 s cooldown protection |
 | **Environmental** | DHT11 temperature & humidity, sampled every 3 s |
-| **Battery** | ADC voltage divider on GPIO 35, mapped to 0–100 % |
+| **Battery** | 6-sample ADC window with median-based outlier filtering; averaged value updated every minute, reported to MQTT every 10 minutes |
 | **Web dashboard** | Single-page app (Hebrew RTL), live polling every 5 s |
+| **Web monitor** | Raw sensor data, machine state, last RFID code at `/monitor` |
+| **Servo calibration** | Browser-based calibration page at `/calib` — adjust direction and duration, saved to NVS |
+| **Startup calibration** | On every power-on, servo performs open → 10 s wait → lock to confirm known position |
+| **Dual Wi-Fi** | `WiFiMulti` fallback between two configured networks |
 | **MQTT** | Home Assistant MQTT autodiscovery for temperature, humidity, battery, lock state, last event, boot count |
-| **Deep sleep** | Sleeps after 60 s idle; wakes on GPIO touch or 1-hour timer |
+| **Deep sleep** | Sleeps after 2 min idle; wakes on GPIO touch or 30-minute timer |
 | **Offline buffering** | Up to 200 sensor records survive deep sleep in RTC RAM and are flushed to MQTT on next connection |
 
 ---
@@ -68,36 +74,44 @@ SmartSafe Pro turns an ESP32 into a full-featured electronic safe controller. It
 |---|---|
 | ESP32 DevKit (38-pin or 30-pin) | Any variant with GPIO 32 capable of EXT0 wake |
 | Wiegand RFID reader (125 kHz or 13.56 MHz) | DATA0 → GPIO 5, DATA1 → GPIO 13 |
-| 12 V electromagnetic lock or strike | Driven via SSR on GPIO 25 |
-| Boost converter enable | MOSFET gate on GPIO 14; powers 12 V lock rail |
+| SG90 continuous-rotation servo | Signal → GPIO 25; powered from 5 V rail |
+| Boost converter enable | MOSFET gate on GPIO 14; powers 12 V RFID reader rail |
 | DHT11 sensor | GPIO 4, 3.3 V supply |
-| Voltage divider (2× equal resistors) | Halves battery voltage into GPIO 35 (max 3.3 V) |
+| Voltage divider (2× 100 kΩ + 0.1 µF cap) | Halves battery voltage into GPIO 35 (max 3.3 V) |
 | Touch / wake button | GPIO 32, active HIGH |
 | Dual LED (red / green) | GPIO 19 / 18, 220 Ω series resistors |
 
-> **Note:** GPIO 12 is avoided for the second Wiegand line — it affects the boot strapping voltage on some ESP32 modules.
+> **Note:** GPIO 12 is avoided for the second Wiegand line — it affects the boot-strapping voltage on some ESP32 modules.
 
 ---
 
 ## Wiring Diagram
 
 ```
-Battery (+)──┬──[2 MΩ]──┬──GPIO 35
-             │           │
-             │         [2 MΩ]
-             │           │
-             │          GND
+Battery (+)──┬──[100 kΩ]──┬──GPIO 35
+             │             │
+             │           [100 kΩ]
+             │             │
+             │           [0.1 µF]
+             │             │
+             │            GND
              │
              └── Boost converter Vin
                       │
                GPIO 14 → MOSFET gate → Boost EN
                       │
-               Boost Vout (12 V) → Lock (+)
-                                         │
-               GPIO 25 → SSR → Lock (−)
+               Boost Vout (12 V) → RFID reader VCC
+
+Servo (SG90 continuous rotation):
+  Red   → 5 V
+  Brown → GND
+  Orange (signal) → GPIO 25  (50 Hz PWM, 16-bit LEDC)
+    1.0 ms pulse → opens lock
+    2.0 ms pulse → closes lock
+    0 V (no signal) → motor stops; latch holds mechanically
 
 RFID Reader:
-  VCC  → 5 V (or 3.3 V depending on reader)
+  VCC  → Boost 12 V (or 5 V depending on reader model)
   GND  → GND
   D0   → GPIO 5
   D1   → GPIO 13
@@ -137,9 +151,9 @@ See [platformio.ini](platformio.ini) for the full build configuration.
 // include/secrets.h  (excluded from git)
 #pragma once
 
-// Wi-Fi
-const char* ssid     = "YOUR_WIFI_SSID";
-const char* password = "YOUR_WIFI_PASSWORD";
+// Wi-Fi — add up to two networks; WiFiMulti connects to the strongest available
+const char* ssid      = "YOUR_WIFI_SSID";
+const char* password  = "YOUR_WIFI_PASSWORD";
 
 // Web dashboard (HTTP Basic Auth)
 const char* www_username = "admin";
@@ -161,43 +175,66 @@ uint32_t masterKey = YOUR_MASTER_CARD_CODE;
 
 | Macro | Default | Purpose |
 |---|---|---|
-| `LOCK_OPEN_MS` | 3000 ms | How long the lock stays open after auth |
-| `LOCK_COOLDOWN_MS` | 2000 ms | Minimum time between consecutive unlocks |
+| `LOCK_OPEN_MS` | 15 000 ms | How long the lock stays open after auth |
+| `LOCK_COOLDOWN_MS` | 2 000 ms | Minimum time between consecutive unlocks |
 | `READER_TIMEOUT_MS` | 15 000 ms | RFID reader auto-shutoff if no card presented |
 | `WIEGAND_TIMEOUT_US` | 200 000 µs | Inter-bit silence that marks end of Wiegand frame |
-| `BOOSTER_SETTLING_MS` | 200 ms | Grace period after enabling 12 V rail before reading RFID bits |
-| `SLEEP_TIMEOUT_MS` | 60 000 ms | Idle time before entering deep sleep |
-| `REPORT_INTERVAL_US` | 3 600 s | Deep-sleep timer wake interval for hourly MQTT reporting |
+| `BOOSTER_SETTLING_MS` | 80 ms | Grace period after enabling 12 V rail before reading RFID bits |
+| `SERVO_MOVE_MS` | 850 ms | Duration of each servo rotation burst (tune to your latch travel) |
+| `SLEEP_TIMEOUT_MS` | 120 000 ms | Idle time before entering deep sleep (2 minutes) |
+| `REPORT_INTERVAL_US` | 1 800 s | Deep-sleep timer wake interval (30 minutes) |
+| `BAT_SAMPLE_MS` | 10 000 ms | Battery ADC sample interval |
+| `BAT_SAMPLES` | 6 | Sample window size (one full minute) |
+| `BAT_OUTLIER_V` | 0.3 V | Max deviation from median to be included in average |
+| `MQTT_PERIODIC_MS` | 600 000 ms | MQTT battery report interval when awake (10 minutes) |
+
+### Servo calibration
+
+Direction and duration can be adjusted live from the browser at `/calib` without reflashing. Settings are stored in NVS and survive power cycles. The firmware defaults are:
+
+| Direction | Duty cycle | Effect |
+|---|---|---|
+| Unlock (A) | 1.0 ms pulse (duty 3276 / 65535) | Rotates servo to open latch |
+| Lock (B) | 2.0 ms pulse (duty 6553 / 65535) | Rotates servo to close latch |
+
+If the servo turns the wrong way, swap the direction in `/calib` — no hardware changes needed.
 
 ---
 
-## Web Dashboard
+## Web Interface
 
-Served at `http://smartsafe.local` (mDNS) or the device's IP address on port 80. Protected by HTTP Basic Authentication.
+### Dashboard (`/`)
 
-**Live widgets:**
+Served at `http://smartsafe.local` (mDNS) or the device IP on port 80. Protected by HTTP Basic Auth.
+
 - Lock state icon (animates on unlock)
 - Temperature, humidity, battery percentage with bar
-- Wi-Fi RSSI signal strength bars
+- Wi-Fi RSSI signal strength
 - System uptime
+- Card management (list, delete)
+- Activity log (last 15 events)
+- Remote unlock button
 
-**Card management:**
-- Lists all authorised RFID cards stored in NVS
-- One-click delete button per card
+### Monitor (`/monitor`)
 
-**Activity log:**
-- Last 15 events, colour-coded (green = access granted, red = denied/error)
-- Timestamps formatted as `HH:MM:SS` uptime
+Raw diagnostic view — no authentication required on the local network:
+- DHT11 raw readings and computed values
+- Battery ADC raw value, voltage, and filtered average
+- Current machine state
+- Last RFID code scanned
 
-**Remote unlock button:**
-- Sends `GET /open?t=<token>` with the configured API token
-- Blocked during 2-second cooldown with HTTP 429
+### Calibration (`/calib`)
+
+Browser-based servo tuning page (HTTP Basic Auth):
+- Test CW / CCW rotation with a configurable duration
+- Save direction and move duration permanently to NVS
+- Changes take effect immediately without reboot
 
 ---
 
 ## REST API
 
-All endpoints require HTTP Basic Auth.
+All endpoints require HTTP Basic Auth unless noted.
 
 | Method | Endpoint | Description | Response |
 |---|---|---|---|
@@ -207,6 +244,10 @@ All endpoints require HTTP Basic Auth.
 | `GET` | `/api/cards` | List authorised cards | `{"cards":["12345","67890"]}` |
 | `POST` | `/api/cards/delete?id=<code>` | Remove a card | `200 OK`, `404 Not found` |
 | `GET` | `/api/log` | Activity log (newest first) | `{"log":[{"time":"00:01:23","msg":"..."}]}` |
+| `GET` | `/monitor` | Raw sensor monitor page | `200 text/html` |
+| `GET` | `/api/monitor` | Raw sensor data JSON | `200 application/json` |
+| `GET` | `/calib` | Servo calibration page | `200 text/html` |
+| `POST` | `/api/calib` | Save calibration settings | `200 OK` |
 
 ### `/api/status` response
 
@@ -257,20 +298,24 @@ The device publishes MQTT autodiscovery messages on first connect, so entities a
 ## State Machine
 
 ```
-          ┌──────────┐
- Boot/    │          │  Touch / Web open
- Timeout  │   IDLE   │──────────────────► READER_ACTIVE
-          │          │                         │
-          └──────────┘                         │ Valid card / web token
-               ▲                               ▼
-               │                          LOCK_OPEN
-               │                               │
-               └───────── 3 s elapsed ─────────┘
+          ┌──────────────────────────────────────┐
+          │                                      │ 2 min idle
+          ▼                                      │
+       ┌──────────┐   Touch / Web open   ┌───────────────┐
+ Boot  │          │─────────────────────►│ READER_ACTIVE │
+ Touch │   IDLE   │                      └───────────────┘
+ Timer │          │◄──────────┐                  │ Valid card /
+       └──────────┘  15 s     │                  │ web token
+            │      elapsed    │                  ▼
+            │                 │           ┌────────────┐
+            ▼                 └───────────│  LOCK_OPEN │
+       DEEP SLEEP                         └────────────┘
 ```
 
-- **IDLE** — 12 V boost and lock SSR are off; edit mode is cleared.
+- **IDLE** — Servo PWM signal off (latch holds mechanically); 12 V boost off; edit mode cleared. Enters deep sleep after 2 minutes of inactivity.
 - **READER_ACTIVE** — 12 V boost enabled; Wiegand ISR active; times out after 15 s.
-- **LOCK_OPEN** — SSR energised; 12 V boost off; auto-closes after 3 s.
+- **LOCK_OPEN** — Servo has rotated to open position; PWM signal cut; auto-closes after 15 s.
+- **DEEP SLEEP** — Full deep sleep; wakes on GPIO 32 touch (→ IDLE) or 30-minute timer (→ sample sensors → MQTT → back to sleep).
 
 **Edit mode** (card management) is entered by presenting the master card while in `READER_ACTIVE`. The next card scanned is registered if unknown, or deleted if it already exists.
 
@@ -278,18 +323,28 @@ The device publishes MQTT autodiscovery messages on first connect, so entities a
 
 ## Power Management
 
-The firmware implements a two-wake-reason model:
-
 | Wake reason | Behaviour |
 |---|---|
-| **Boot** | Full initialisation — Wi-Fi, web server, RFID reader active |
-| **Touch (EXT0, GPIO 32)** | Same as boot; immediately activates RFID reader |
-| **Timer (1 h)** | Reads DHT11 + battery, connects Wi-Fi, flushes RTC buffer, publishes state to MQTT, **returns to sleep immediately** |
+| **Boot** | Full init — startup calibration, Wi-Fi, web server, RFID ready, enters IDLE |
+| **Touch (EXT0, GPIO 32)** | Full init (no calibration) — enters IDLE directly |
+| **Timer (30 min)** | Reads DHT11 + battery, connects Wi-Fi, flushes RTC buffer, publishes MQTT, **returns to sleep immediately** |
 
-After 60 seconds of inactivity in boot/touch mode, the device:
-1. Disconnects MQTT and Wi-Fi
-2. Stops Bluetooth
-3. Powers down GPIO outputs
+### Startup calibration
+
+On every power-on (not on deep sleep wake), the servo performs a calibration sequence before the system becomes active:
+
+1. Rotate to **open** position for 850 ms
+2. Hold open for **10 seconds**
+3. Rotate to **closed** (locked) position for 850 ms
+
+This guarantees the latch is in a known locked state regardless of its position at shutdown. The sequence is skipped on deep sleep wakes (`RTC_DATA_ATTR` flag).
+
+### Idle timeout
+
+After **2 minutes** of inactivity in IDLE mode the device:
+1. Disconnects Wi-Fi
+2. Enables EXT0 wake on GPIO 32 (touch)
+3. Enables timer wake at 30-minute interval
 4. Enters `esp_deep_sleep_start()`
 
 ---
