@@ -2,12 +2,14 @@
 #include <WiFi.h>
 #include <WiFiMulti.h>
 #include <ESPAsyncWebServer.h>
-#include <DHT.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
 #include <Preferences.h>
 #include <time.h>
 #include <ESPmDNS.h>
 #include <esp_sleep.h>
 #include <esp_wifi.h>
+#include <driver/rtc_io.h>
 #include <PubSubClient.h>
 
 // =====================================================================
@@ -18,8 +20,7 @@
 #define TOUCH_PIN        32
 #define BOOST_12V_EN_PIN 14
 #define LOCK_SSR         25
-#define DHTPIN           4
-#define DHTTYPE          DHT11
+#define DHTPIN           16
 #define BAT_ADC          35
 #define LED_RED_PIN      19
 #define LED_GREEN_PIN    18
@@ -43,7 +44,7 @@
 #define SERVO_CR_LOCK    6553   // 2.0ms — סיבוב לכיוון נעילה
 // אם הנעל מסתובבת לכיוון ההפוך — פשוט החלף את ערכי UNLOCK ו-LOCK
 #define SERVO_MOVE_MS    850    // כוונן: מספיק ms עד שהתפס נועל/נפתח לגמרי
-#define SLEEP_TIMEOUT_MS    120000  // 2 דקות ב-IDLE לפני שינה עמוקה
+#define SLEEP_TIMEOUT_MS    300000  // 5 דקות ב-IDLE לפני שינה עמוקה
 
 // Wake-up timer לשינה עמוקה
 #define REPORT_INTERVAL_US      (30ULL * 60ULL * 1000000ULL)  // Wake כל 30 דקות לדיגום
@@ -59,10 +60,10 @@
 // הגדרות רשת
 // =====================================================================
 // רשתות WiFi — WiFiMulti מתחבר לחזקה שזמינה
-//const char* ssid         = "YOUR_WIFI_SSID";
-//const char* password     = "YOUR_WIFI_PASSWORD";
-const char* ssid         = "YOUR_WIFI_SSID_2";
-const char* password     = "YOUR_WIFI_PASSWORD_2";
+const char* ssid         = "YOUR_WIFI_SSID";
+const char* password     = "YOUR_WIFI_PASSWORD";
+//const char* ssid         = "YOUR_WIFI_SSID_2";
+//const char* password     = "YOUR_WIFI_PASSWORD_2";
 const char* www_username = "admin";
 const char* www_password = "YOUR_WEB_PASSWORD";
 const char* api_token    = "YOUR_API_TOKEN";
@@ -102,6 +103,7 @@ RTC_DATA_ATTR uint8_t      rtcHead       = 0;
 RTC_DATA_ATTR uint8_t      rtcCount      = 0;
 RTC_DATA_ATTR uint32_t     bootCount     = 0;
 RTC_DATA_ATTR bool         firstBootCalib = true;  // false אחרי כיול ראשון, שורד שינה עמוקה
+RTC_DATA_ATTR uint32_t     wakeGlitchUs   = 0;     // אורך פולס הפרזיט ב-GPIO25 בעליה משינה
 
 void rtcAddRecord(float t, float h, uint8_t bat, uint8_t lockSt,
                   uint8_t evType, uint32_t cardCode = 0) {
@@ -147,7 +149,8 @@ unsigned long activityTimer    = 0;
 bool     editMode  = false;
 uint32_t masterKey = 0;
 
-DHT            dht(DHTPIN, DHTTYPE);
+OneWire        oneWire(DHTPIN);
+DallasTemperature ds18(&oneWire);
 AsyncWebServer server(80);
 Preferences    prefs;
 WiFiClient     wifiClient;
@@ -199,7 +202,8 @@ struct BatteryInfo { int raw; float vbat; int pct; };
 BatteryInfo getBatteryInfo() {
     BatteryInfo b;
     b.raw  = analogRead(BAT_ADC);
-    b.vbat = (b.raw / 4095.0f) * 3.3f * 2.0f;
+    // analogReadMilliVolts uses ESP32 eFuse ADC calibration — far more accurate than raw counts
+    b.vbat = (analogReadMilliVolts(BAT_ADC) / 1000.0f) * 2.0f;  // ×2 for voltage divider
     b.pct  = constrain((int)((b.vbat - 3.0f) / 1.2f * 100.0f), 0, 100);
     return b;
 }
@@ -491,7 +495,7 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(
 </div>
 <div class="g2">
   <div class="card"><div class="lbl">טמפרטורה</div><div class="val" id="tVal">--</div><div class="sub2">°C</div></div>
-  <div class="card"><div class="lbl">לחות</div><div class="val" id="hVal">--</div><div class="sub2">% RH</div></div>
+  <div class="card"><div class="lbl">לחות</div><div class="val" id="hVal">N/A</div><div class="sub2">DS18B20</div></div>
   <div class="card">
     <div class="lbl">סוללה</div>
     <div class="val" id="bVal">--%</div>
@@ -522,7 +526,7 @@ async function fetchSt(){
     document.getElementById('lStat').textContent=lk?'נעול':'פתוח';
     const stMap={IDLE:'המתנה',READER_ACTIVE:'קורא פעיל',LOCK_OPEN:'דלת פתוחה'};
     document.getElementById('lSub').textContent='מצב: '+(stMap[d.state]||d.state);
-    if(d.temp>-40){document.getElementById('tVal').textContent=d.temp.toFixed(1);document.getElementById('hVal').textContent=d.hum.toFixed(0);}
+    document.getElementById('tVal').textContent=(d.temp>-40)?d.temp.toFixed(1):'ERR';
     const b=Math.min(100,Math.max(0,d.battery));
     document.getElementById('bVal').textContent=b+'%';
     const bf=document.getElementById('bBar');bf.style.width=b+'%';
@@ -647,10 +651,10 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(
   <div class="bits-sub" id="rfidBits">לא פעיל</div>
 </div>
 
-<div class="sec">חיישן DHT — נתון גולמי (פלט דיגיטלי ישיר)</div>
+<div class="sec">חיישן DS18B20 — טמפרטורה (OneWire, GPIO16)</div>
 <div class="g2">
   <div class="card"><div class="lbl">טמפרטורה</div><div class="val" id="tRaw">--</div><div style="color:var(--tm);font-size:.68rem;margin-top:3px">°C</div></div>
-  <div class="card"><div class="lbl">לחות</div><div class="val" id="hRaw">--</div><div style="color:var(--tm);font-size:.68rem;margin-top:3px">% RH</div></div>
+  <div class="card"><div class="lbl">לחות</div><div class="val" id="hRaw">N/A</div><div style="color:var(--tm);font-size:.68rem;margin-top:3px">DS18B20</div></div>
 </div>
 <div class="card">
   <div class="row"><span style="color:var(--tm)">גיל קריאה אחרונה</span><span class="mono" id="dhtAge">--</span></div>
@@ -693,8 +697,7 @@ async function refresh(){
     document.getElementById('scanDot').className='dot '+(sc?'on':'off');
     document.getElementById('rfidCode').textContent=(sc&&d.rfid.bits>0)?String(d.rfid.code):'---';
     document.getElementById('rfidBits').textContent=(sc&&d.rfid.bits>0)?(d.rfid.bits+' bits'):'לא פעיל';
-    document.getElementById('tRaw').textContent=d.dht.temp!==null?d.dht.temp.toFixed(1):'ERR';
-    document.getElementById('hRaw').textContent=d.dht.hum!==null?d.dht.hum.toFixed(1):'ERR';
+    document.getElementById('tRaw').textContent=d.dht.temp!==null?d.dht.temp.toFixed(2):'ERR';
     document.getElementById('dhtAge').textContent=(d.dht.age_ms/1000).toFixed(1)+'s';
     document.getElementById('batRaw').textContent=d.bat_live.raw;
     document.getElementById('batV').textContent=d.bat_live.v.toFixed(3)+' V';
@@ -1107,12 +1110,21 @@ void setupServerRoutes() {
         json += "}";
         req->send(200, "application/json", json);
     });
+
 }
 
 // =====================================================================
 // Setup
 // =====================================================================
 void setup() {
+    // מדידת פולס פרזיט ב-GPIO25 — חייב להיות לפני כל delay
+    if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0) {
+        pinMode(LOCK_SSR, INPUT_PULLDOWN);
+        wakeGlitchUs = (uint32_t)pulseIn(LOCK_SSR, HIGH, 10000UL);
+    } else {
+        wakeGlitchUs = 0;
+    }
+
     Serial.begin(115200);
     delay(300);
     bootCount++;
@@ -1130,14 +1142,15 @@ void setup() {
 
     // ── Timer Wake: קרא חיישנים, דווח, חזור לשינה מיד ──────────────
     if (wakeReason == WAKE_TIMER) {
-        dht.begin();
-        delay(300);
-        float t = dht.readTemperature();
-        float h = dht.readHumidity();
+        ds18.begin();
+        ds18.requestTemperatures();
+        delay(750);  // 12-bit conversion — blocking OK here, going back to sleep after
+        float t = ds18.getTempCByIndex(0);
+        if (t < -100.0f) t = NAN;
         int   bat = getBatteryPct();
-        Serial.printf("[TIMER] T=%.1f H=%.0f BAT=%d\n", t, h, bat);
+        Serial.printf("[TIMER] T=%.1f BAT=%d\n", t, bat);
 
-        rtcAddRecord(t, h, (uint8_t)bat, 0, 0);
+        rtcAddRecord(t, NAN, (uint8_t)bat, 0, 0);
 
         // נסה WiFi + MQTT
         WiFi.mode(WIFI_STA);
@@ -1151,7 +1164,7 @@ void setup() {
             if (connectMQTT()) {
                 mqttPublishDiscovery();
                 mqttFlushBuffer();
-                mqttPublishState(t, h, bat, true);
+                mqttPublishState(t, NAN, bat, true);
                 for (int i = 0; i < 20; i++) { mqttClient.loop(); delay(100); }
                 mqttClient.loop();
                 delay(200);
@@ -1164,6 +1177,11 @@ void setup() {
         }
 
         Serial.println("[SYS] Timer wake done — returning to deep sleep");
+        // GPIO25 servo hold
+        rtc_gpio_init(GPIO_NUM_25);
+        rtc_gpio_set_direction(GPIO_NUM_25, RTC_GPIO_MODE_OUTPUT_ONLY);
+        rtc_gpio_set_level(GPIO_NUM_25, 0);
+        rtc_gpio_hold_en(GPIO_NUM_25);
         esp_sleep_enable_ext0_wakeup(GPIO_NUM_32, 1);
         esp_sleep_enable_timer_wakeup(REPORT_INTERVAL_US);
         esp_deep_sleep_start();
@@ -1187,7 +1205,27 @@ void setup() {
     servoUnlockDuty = dirSwapped ? SERVO_CR_LOCK   : SERVO_CR_UNLOCK;
     servoLockDuty   = dirSwapped ? SERVO_CR_UNLOCK : SERVO_CR_LOCK;
 
-    dht.begin();
+    ds18.begin();
+    ds18.setResolution(12);
+    ds18.setWaitForConversion(false);
+    ds18.requestTemperatures();
+    delay(800);  // 12-bit conversion time
+    {
+        float _t = ds18.getTempCByIndex(0);
+        if (_t > -100.0f) {
+            cachedTemp = _t;
+            Serial.printf("[DS18B20] Init: %.2f°C on GPIO%d\n", _t, DHTPIN);
+        } else {
+            Serial.printf("[DS18B20] Init FAILED — check GPIO%d wiring & 4.7kΩ pull-up to 3.3V\n", DHTPIN);
+        }
+    }
+    lastDHTRead = millis();
+
+    // שחרור hold של GPIO25 — רק אם עלינו משינה עמוקה (לא בבוט ראשון)
+    if (wakeReason == WAKE_TOUCH) {
+        rtc_gpio_hold_dis(GPIO_NUM_25);
+        rtc_gpio_deinit(GPIO_NUM_25);
+    }
 
     // אתחול סרוו SG90 — GPIO25, 50Hz PWM
     ledcSetup(SERVO_CH, SERVO_FREQ_HZ, SERVO_RES_BITS);
@@ -1205,6 +1243,8 @@ void setup() {
         Serial.println(WiFi.localIP());
         Serial.println("[WiFi] URL: http://smartsafe.local");
         Serial.println("=============================");
+
+
         if (connectMQTT()) {
             mqttPublishDiscovery();
             mqttFlushBuffer();
@@ -1220,8 +1260,21 @@ void setup() {
     activityTimer = millis();
 
     if (wakeReason == WAKE_TOUCH) {
-        addLog("התעוררות ממגע — IDLE");
-        Serial.println("[SYS] Wake from touch — returning to IDLE");
+        Serial.printf("[WAKE] GPIO25 glitch measured: %u µs\n", wakeGlitchUs);
+        if (wakeGlitchUs > 0) {
+            ledcWrite(SERVO_CH, servoUnlockDuty);
+            delayMicroseconds(wakeGlitchUs);
+            ledcWrite(SERVO_CH, 0);
+            Serial.printf("[COMP] Applied %u µs compensation pulse (unlock dir)\n", wakeGlitchUs);
+        } else {
+            Serial.println("[WAKE] No glitch detected in setup() — may be bootloader-phase");
+        }
+        // כפה READER_ACTIVE — הכפתור כבר לא HIGH כשloop() מתחיל (setup לוקח 10+ שניות)
+        // ללא זה, הגלאי קצה מחמיץ את הלחיצה ו-activityTimer אף פעם לא מתרענן מלחיצת ה-wake
+        addLog("התעוררות ממגע — מפעיל קורא");
+        Serial.println("[SYS] Wake from touch — activating reader");
+        setSystemState(READER_ACTIVE);
+        activityTimer = millis();
     } else {
         addLog("מערכת הופעלה");
         Serial.println("[SYS] Boot Complete");
@@ -1241,17 +1294,23 @@ void loop() {
     // MQTT keepalive
     if (mqttClient.connected()) mqttClient.loop();
 
-    // DHT כל 3 שניות
-    if (millis() - lastDHTRead >= 3000) {
+    // DS18B20 — בקשת המרה כל 5 שניות, קריאת תוצאה אחרי 750ms (non-blocking)
+    static bool ds18Pending = false;
+    static unsigned long ds18ReqAt = 0;
+    if (!ds18Pending && millis() - lastDHTRead >= 5000) {
+        ds18.requestTemperatures();
+        ds18ReqAt = millis();
+        ds18Pending = true;
+    }
+    if (ds18Pending && millis() - ds18ReqAt >= 750) {
+        float t = ds18.getTempCByIndex(0);
+        ds18Pending = false;
         lastDHTRead = millis();
-        float t = dht.readTemperature();
-        float h = dht.readHumidity();
-        if (!isnan(t) && !isnan(h)) {
+        if (t > -100.0f) {
             cachedTemp = t;
-            cachedHum  = h;
-            Serial.printf("[DHT] Temp: %.1f°C  Hum: %.0f%%\n", t, h);
+            Serial.printf("[DS18B20] %.2f°C\n", t);
         } else {
-            Serial.println("[DHT] Read FAILED — check wiring (use 3.3V not 5V!)");
+            Serial.println("[DS18B20] Read FAILED — check wiring");
         }
     }
 
@@ -1354,12 +1413,17 @@ void loop() {
             mqttPublishState(cachedTemp, cachedHum, getBatteryPct(), true);
     }
 
-    // כניסה לשינה עמוקה אחרי 2 דקות ב-IDLE
+    // כניסה לשינה עמוקה אחרי 5 דקות ב-IDLE
     if (currentState == IDLE && millis() - activityTimer > SLEEP_TIMEOUT_MS) {
-        addLog("כניסה לשינה (2 דק' ב-IDLE)");
-        Serial.println("[SYS] No activity — entering deep sleep");
+        addLog("כניסה לשינה (5 דק' ב-IDLE)");
+        Serial.printf("[SYS] No activity for %lus — entering deep sleep\n", (millis() - activityTimer) / 1000);
         WiFi.disconnect(true);
         WiFi.mode(WIFI_OFF);
+        // GPIO25 servo hold
+        rtc_gpio_init(GPIO_NUM_25);
+        rtc_gpio_set_direction(GPIO_NUM_25, RTC_GPIO_MODE_OUTPUT_ONLY);
+        rtc_gpio_set_level(GPIO_NUM_25, 0);
+        rtc_gpio_hold_en(GPIO_NUM_25);
         esp_sleep_enable_ext0_wakeup(GPIO_NUM_32, 1);
         esp_sleep_enable_timer_wakeup(REPORT_INTERVAL_US);
         esp_deep_sleep_start();
