@@ -47,7 +47,7 @@
 #define SLEEP_TIMEOUT_MS    300000  // 5 דקות ב-IDLE לפני שינה עמוקה
 
 // Wake-up timer לשינה עמוקה
-#define REPORT_INTERVAL_US      (30ULL * 60ULL * 1000000ULL)  // Wake כל 30 דקות לדיגום
+#define REPORT_INTERVAL_US      (10ULL * 60ULL * 1000000ULL)  // Wake כל 10 דקות לדיגום
 #define WIFI_CONNECT_TIMEOUT_MS 10000
 
 // מדידת סוללה
@@ -69,7 +69,7 @@ const char* www_password = "YOUR_WEB_PASSWORD";
 const char* api_token    = "YOUR_API_TOKEN";
 
 // MQTT — עדכן את ה-IP של ה-HA שלך
-const char* mqtt_server   = "YOUR_MQTT_SERVER_IP";  // <-- שנה לIP של ה-HA
+const char* mqtt_server   = "YOUR_MQTT_SERVER_IP";
 const int   mqtt_port     = 1883;
 const char* mqtt_user     = "YOUR_MQTT_USER";
 const char* mqtt_pass     = "YOUR_MQTT_PASS";
@@ -84,7 +84,7 @@ const char* mqtt_clientid = "smartsafe_pro";
 // =====================================================================
 // RTC Memory Buffer — שורד Deep Sleep (8KB זמין, משתמשים ב-~4KB)
 // =====================================================================
-#define RTC_BUFFER_SIZE 200
+#define RTC_BUFFER_SIZE 72   // 12 שעות × 6 רשומות/שעה (wake כל 10 דקות)
 
 struct __attribute__((packed)) SensorRecord {
     uint32_t timestamp_s;  // מאז boot
@@ -147,7 +147,7 @@ unsigned long lastUnlockTime   = 0;
 unsigned long boosterStartTime = 0;
 unsigned long activityTimer    = 0;
 bool     editMode  = false;
-uint32_t masterKey = 0;
+uint32_t masterKey = 0;  // YOUR_MASTER_CARD_CODE — set via Preferences or recompile
 
 OneWire        oneWire(DHTPIN);
 DallasTemperature ds18(&oneWire);
@@ -1148,9 +1148,7 @@ void setup() {
         float t = ds18.getTempCByIndex(0);
         if (t < -100.0f) t = NAN;
         int   bat = getBatteryPct();
-        Serial.printf("[TIMER] T=%.1f BAT=%d\n", t, bat);
-
-        rtcAddRecord(t, NAN, (uint8_t)bat, 0, 0);
+        Serial.printf("[TIMER] T=%.1f BAT=%d\n", isnan(t) ? -99.0f : t, bat);
 
         // נסה WiFi + MQTT
         WiFi.mode(WIFI_STA);
@@ -1163,16 +1161,20 @@ void setup() {
             Serial.printf("[WiFi] Connected: %s\n", WiFi.localIP().toString().c_str());
             if (connectMQTT()) {
                 mqttPublishDiscovery();
-                mqttFlushBuffer();
-                mqttPublishState(t, NAN, bat, true);
+                mqttFlushBuffer();                       // שולח רשומות שצבורות מהפעמים הקודמות
+                mqttPublishState(t, NAN, bat, true);    // שולח את הנוכחי ישירות
                 for (int i = 0; i < 20; i++) { mqttClient.loop(); delay(100); }
                 mqttClient.loop();
                 delay(200);
                 mqttClient.disconnect();
+            } else {
+                rtcAddRecord(t, NAN, (uint8_t)bat, 0, 0);  // MQTT נכשל — שמור לפעם הבאה
+                Serial.println("[MQTT] Failed — data buffered");
             }
             WiFi.disconnect(true);
             WiFi.mode(WIFI_OFF);
         } else {
+            rtcAddRecord(t, NAN, (uint8_t)bat, 0, 0);  // אין WiFi — שמור לפעם הבאה
             Serial.println("[WiFi] Timeout — data buffered for next wake");
         }
 
@@ -1234,7 +1236,7 @@ void setup() {
 
     WiFi.mode(WIFI_STA);
     wifiMulti.addAP(ssid,  password);
-    for (int i = 0; i < 20 && wifiMulti.run() != WL_CONNECTED; i++) delay(500);
+    for (int i = 0; i < 4 && wifiMulti.run() != WL_CONNECTED; i++) delay(500);  // 2s max — WiFi הוא nice-to-have
 
     if (WiFi.status() == WL_CONNECTED) {
         MDNS.begin("smartsafe");
@@ -1276,8 +1278,10 @@ void setup() {
         setSystemState(READER_ACTIVE);
         activityTimer = millis();
     } else {
-        addLog("מערכת הופעלה");
-        Serial.println("[SYS] Boot Complete");
+        addLog("מערכת הופעלה — קורא פעיל");
+        Serial.println("[SYS] Boot — activating reader");
+        setSystemState(READER_ACTIVE);
+        activityTimer = millis();
     }
 }
 
@@ -1293,6 +1297,20 @@ void loop() {
 
     // MQTT keepalive
     if (mqttClient.connected()) mqttClient.loop();
+
+    // WiFi + MQTT reconnect — nice-to-have, נבדק כל 60s כשלא סורקים כרטיס
+    // (כשחוזרים הביתה הרשת עולה ומרוקנת את ה-buffer אוטומטית)
+    static unsigned long lastNetCheck = 0;
+    if (currentState != READER_ACTIVE && millis() - lastNetCheck >= 60000) {
+        lastNetCheck = millis();
+        if (WiFi.status() != WL_CONNECTED) wifiMulti.run(2000);
+        if (WiFi.status() == WL_CONNECTED && !mqttClient.connected()) {
+            if (connectMQTT()) {
+                mqttPublishDiscovery();
+                mqttFlushBuffer();
+            }
+        }
+    }
 
     // DS18B20 — בקשת המרה כל 5 שניות, קריאת תוצאה אחרי 750ms (non-blocking)
     static bool ds18Pending = false;
