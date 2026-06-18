@@ -1,5 +1,9 @@
 # SmartSafe Pro 🔒
 
+<img width="211" height="192" alt="1781762620904" src="https://github.com/user-attachments/assets/e3b03a81-4edf-4e9a-88eb-798c9aa50b14" />
+<img width="209" height="192" alt="1781762613920" src="https://github.com/user-attachments/assets/5638c342-b6c2-4c69-ab2c-1aa2ebd74b0e" />
+
+
 **ESP32-based smart safe controller** with RFID card access, Home Assistant integration, remote web unlock, temperature/humidity monitoring, and deep-sleep power management.
 
 ---
