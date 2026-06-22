@@ -13,66 +13,61 @@
 #include <PubSubClient.h>
 
 // =====================================================================
-// הגדרות פינים
+// Pin Map — ESP32-S3-WROOM-1 N16R8
+// GPIO 22–33 = internal flash/PSRAM — not on board headers
+// RTC-capable GPIOs on S3: 0–21 only
+// ADC1 on S3: GPIO 1–10 (ADC2 unusable with WiFi)
+// GPIO 19/20 = USB D+/D- — never use as outputs
 // =====================================================================
-#define D0_PIN           5   // שונה מ-12 — GPIO12 בעיית Boot
+#define D0_PIN           5
 #define D1_PIN           13
-#define TOUCH_PIN        32
+#define TOUCH_PIN        7    // RTC GPIO — EXT0 deep-sleep wake
 #define BOOST_12V_EN_PIN 14
-#define LOCK_SSR         25
-#define DHTPIN           16
-#define BAT_ADC          35
-#define LED_RED_PIN      19
-#define LED_GREEN_PIN    18
+#define DHTPIN           16   // DS18B20 OneWire
+#define BAT_ADC          4    // ADC1_CH3 — works with WiFi on
+#define MOTOR_PWMA       8    // PWM speed — RTC GPIO, held LOW during sleep
+#define MOTOR_AIN1       18   // Direction 1
+#define MOTOR_AIN2       15   // Direction 2  (NOT 19 — USB D-)
+#define MOTOR_STBY       17   // STBY: LOW=1µA sleep, HIGH=active
+
+// Compile-time GPIO enum constants required by RTC/sleep API
+#define MOTOR_PWMA_GPIO  GPIO_NUM_8
+#define TOUCH_GPIO       GPIO_NUM_7
 
 // =====================================================================
-// הגדרות זמנים
+// Timing
 // =====================================================================
 #define LOCK_OPEN_MS        15000
 #define LOCK_COOLDOWN_MS    2000
 #define READER_TIMEOUT_MS   15000
 #define WIEGAND_TIMEOUT_US  200000
-#define BOOSTER_SETTLING_MS 80   // 200ms גרם לקריאת 11 ביטים בלבד כי התגית מגיבה בt≈170ms
+#define BOOSTER_SETTLING_MS 80
 
-// סרוו SG90 — LEDC 50Hz, רזולוציה 16-bit (מחזור 20ms = 65535 טיקים)
-// SERVO_PIN מוגדר כ-LOCK_SSR (GPIO25) — אותו פין, פרוטוקול PWM במקום SSR
-#define SERVO_CH         0       // LEDC channel
-#define SERVO_FREQ_HZ    50
-#define SERVO_RES_BITS   16
-#define SERVO_CR_STOP    4915   // 1.5ms — עצירה מוחלטת
-#define SERVO_CR_UNLOCK  3276   // 1.0ms — סיבוב לכיוון פתיחה
-#define SERVO_CR_LOCK    6553   // 2.0ms — סיבוב לכיוון נעילה
-// אם הנעל מסתובבת לכיוון ההפוך — פשוט החלף את ערכי UNLOCK ו-LOCK
-#define SERVO_MOVE_MS    850    // כוונן: מספיק ms עד שהתפס נועל/נפתח לגמרי
-#define SLEEP_TIMEOUT_MS    300000  // 5 דקות ב-IDLE לפני שינה עמוקה
+#define MOTOR_MOVE_MS    1000   // default ms to complete lock/unlock stroke
+#define MAX_PWM          150    // 60% duty — limits 5V supply to ~3V for N20
 
-// Wake-up timer לשינה עמוקה
-#define REPORT_INTERVAL_US      (10ULL * 60ULL * 1000000ULL)  // Wake כל 10 דקות לדיגום
+#define SLEEP_TIMEOUT_MS        300000
+#define REPORT_INTERVAL_US      (10ULL * 60ULL * 1000000ULL)
 #define WIFI_CONNECT_TIMEOUT_MS 10000
 
-// מדידת סוללה
-#define BAT_SAMPLE_MS    10000UL  // דגימה כל 10 שניות
-#define BAT_SAMPLES      6        // 6 דגימות = חלון של דקה
-#define BAT_OUTLIER_V    0.3f     // סטייה מקסימלית מה-median כדי להיחשב תקין
-#define MQTT_PERIODIC_MS (10UL * 60UL * 1000UL)  // MQTT ל-HA כל 10 דקות
+#define BAT_SAMPLE_MS    10000UL
+#define BAT_SAMPLES      6
+#define BAT_OUTLIER_V    0.3f
+#define MQTT_PERIODIC_MS (10UL * 60UL * 1000UL)
 
 // =====================================================================
-// הגדרות רשת
+// Network
 // =====================================================================
-// רשתות WiFi — WiFiMulti מתחבר לחזקה שזמינה
-const char* ssid         = "YOUR_WIFI_SSID";
-const char* password     = "YOUR_WIFI_PASSWORD";
-//const char* ssid         = "YOUR_WIFI_SSID_2";
-//const char* password     = "YOUR_WIFI_PASSWORD_2";
+const char* ssid         = "Kedmi";
+const char* password     = "0504241190";
 const char* www_username = "admin";
-const char* www_password = "YOUR_WEB_PASSWORD";
-const char* api_token    = "YOUR_API_TOKEN";
+const char* www_password = "12345678";
+const char* api_token    = "sbs_secure_99";
 
-// MQTT — עדכן את ה-IP של ה-HA שלך
-const char* mqtt_server   = "YOUR_MQTT_SERVER_IP";
+const char* mqtt_server   = "10.0.0.30";
 const int   mqtt_port     = 1883;
-const char* mqtt_user     = "YOUR_MQTT_USER";
-const char* mqtt_pass     = "YOUR_MQTT_PASS";
+const char* mqtt_user     = "SBS_Monitor";
+const char* mqtt_pass     = "SBS123";
 const char* mqtt_clientid = "smartsafe_pro";
 
 #define MQTT_STATE_TOPIC  "smartsafe/state"
@@ -82,28 +77,42 @@ const char* mqtt_clientid = "smartsafe_pro";
 #define MQTT_DEVICE_ID    "smartsafe_pro"
 
 // =====================================================================
-// RTC Memory Buffer — שורד Deep Sleep (8KB זמין, משתמשים ב-~4KB)
+// RTC Memory — survives deep sleep (8 KB available)
 // =====================================================================
-#define RTC_BUFFER_SIZE 72   // 12 שעות × 6 רשומות/שעה (wake כל 10 דקות)
+#define RTC_BUFFER_SIZE 72
 
 struct __attribute__((packed)) SensorRecord {
-    uint32_t timestamp_s;  // מאז boot
+    uint32_t timestamp_s;
     float    temp;
     float    hum;
     uint8_t  battery_pct;
-    uint8_t  lock_state;   // 0=IDLE, 2=LOCK_OPEN
-    uint8_t  event_type;   // 0=periodic, 1=rfid_open, 2=web_open, 3=denied
+    uint8_t  lock_state;
+    uint8_t  event_type;
     uint8_t  reserved;
     uint32_t card_code;
 };
-// 20 bytes × 200 = 4000 bytes
 
 RTC_DATA_ATTR SensorRecord rtcBuffer[RTC_BUFFER_SIZE];
-RTC_DATA_ATTR uint8_t      rtcHead       = 0;
-RTC_DATA_ATTR uint8_t      rtcCount      = 0;
-RTC_DATA_ATTR uint32_t     bootCount     = 0;
-RTC_DATA_ATTR bool         firstBootCalib = true;  // false אחרי כיול ראשון, שורד שינה עמוקה
-RTC_DATA_ATTR uint32_t     wakeGlitchUs   = 0;     // אורך פולס הפרזיט ב-GPIO25 בעליה משינה
+RTC_DATA_ATTR uint8_t      rtcHead   = 0;
+RTC_DATA_ATTR uint8_t      rtcCount  = 0;
+RTC_DATA_ATTR uint32_t     bootCount = 0;
+
+// =====================================================================
+// Graph History — 24h at 10-min intervals (144 × 7 bytes = 1008 B RTC)
+// =====================================================================
+#define GRAPH_BUF_SIZE 144
+
+struct __attribute__((packed)) GraphPoint {
+    uint32_t ts;
+    int16_t  temp10;
+    uint8_t  bat_pct;
+};
+
+RTC_DATA_ATTR GraphPoint graphBuf[GRAPH_BUF_SIZE];
+RTC_DATA_ATTR uint8_t    graphHead  = 0;
+RTC_DATA_ATTR uint8_t    graphCount = 0;
+RTC_DATA_ATTR uint32_t   ntpEpoch   = 0;
+RTC_DATA_ATTR uint32_t   ntpMillis  = 0;
 
 void rtcAddRecord(float t, float h, uint8_t bat, uint8_t lockSt,
                   uint8_t evType, uint32_t cardCode = 0) {
@@ -126,18 +135,39 @@ int rtcGetIdx(int pos) {
     return (rtcHead + pos) % RTC_BUFFER_SIZE;
 }
 
+uint32_t getEpoch() {
+    if (ntpEpoch == 0) return (uint32_t)(millis() / 1000);
+    if (millis() < ntpMillis) return ntpEpoch;
+    return ntpEpoch + (uint32_t)((millis() - ntpMillis) / 1000);
+}
+
+void graphAddPoint(float temp, int bat) {
+    GraphPoint p;
+    p.ts      = getEpoch();
+    p.temp10  = isnan(temp) ? -9990 : (int16_t)(temp * 10.0f);
+    p.bat_pct = (uint8_t)constrain(bat, 0, 100);
+    graphBuf[graphHead] = p;
+    graphHead = (graphHead + 1) % GRAPH_BUF_SIZE;
+    if (graphCount < GRAPH_BUF_SIZE) graphCount++;
+}
+
+int graphGetIdx(int pos) {
+    if (graphCount < GRAPH_BUF_SIZE) return pos;
+    return (graphHead + pos) % GRAPH_BUF_SIZE;
+}
+
 // =====================================================================
-// מצבי מערכת
+// State Machine
 // =====================================================================
-enum SystemState  { IDLE, READER_ACTIVE, LOCK_OPEN };
-enum WakeReason   { WAKE_BOOT, WAKE_TOUCH, WAKE_TIMER };
+enum SystemState { IDLE, READER_ACTIVE, LOCK_OPEN };
+enum WakeReason  { WAKE_BOOT, WAKE_TOUCH, WAKE_TIMER };
 
 SystemState currentState = IDLE;
 WakeReason  wakeReason   = WAKE_BOOT;
 
 struct WiegandData {
-    volatile uint32_t code;
-    volatile int      bits;
+    volatile uint32_t      code;
+    volatile int           bits;
     volatile unsigned long lastMicros;
 };
 WiegandData v_rfid = {0, 0, 0};
@@ -147,15 +177,15 @@ unsigned long lastUnlockTime   = 0;
 unsigned long boosterStartTime = 0;
 unsigned long activityTimer    = 0;
 bool     editMode  = false;
-uint32_t masterKey = 0;  // YOUR_MASTER_CARD_CODE — set via Preferences or recompile
+uint32_t masterKey = 10311717;
 
-OneWire        oneWire(DHTPIN);
+OneWire           oneWire(DHTPIN);
 DallasTemperature ds18(&oneWire);
-AsyncWebServer server(80);
-Preferences    prefs;
-WiFiClient     wifiClient;
-WiFiMulti      wifiMulti;
-PubSubClient   mqttClient(wifiClient);
+AsyncWebServer    server(80);
+Preferences       prefs;
+WiFiClient        wifiClient;
+WiFiMulti         wifiMulti;
+PubSubClient      mqttClient(wifiClient);
 
 float         cachedTemp  = NAN;
 float         cachedHum   = NAN;
@@ -163,16 +193,15 @@ unsigned long lastDHTRead = 0;
 
 float         batSamples[BAT_SAMPLES] = {};
 int           batSampleIdx    = 0;
-float         batVAvg         = NAN;   // מיצוע מסונן של מתח הסוללה
-int           batPctAvg       = -1;    // אחוז מחושב מהמיצוע
+float         batVAvg         = NAN;
+int           batPctAvg       = -1;
 unsigned long lastBatSampleMs = 0;
 unsigned long lastMqttMs      = 0;
 
-// ערכי סרוו בזמן ריצה — נטענים מ-Preferences, ניתנים לכיול דרך /calib
-uint32_t      servoUnlockDuty = SERVO_CR_UNLOCK;
-uint32_t      servoLockDuty   = SERVO_CR_LOCK;
-int           servoMoveMs     = SERVO_MOVE_MS;
-volatile unsigned long calibStopAt = 0;  // לביטול סיבוב כיול בלי delay
+// Motor runtime config — loaded from Preferences, tunable via /calib
+int           motorMoveMs     = MOTOR_MOVE_MS;
+bool          motorDirSwapped = false;          // true → A=lock, B=unlock
+volatile unsigned long motorStopAt = 0;
 
 // =====================================================================
 // Activity Log
@@ -184,33 +213,28 @@ int logHead = 0, logCount = 0;
 
 void addLog(const char* msg) {
     strlcpy(actLog[logHead].msg, msg, sizeof(actLog[0].msg));
-    actLog[logHead].ts = millis();
+    actLog[logHead].ts = (ntpEpoch > 0 && millis() >= ntpMillis)
+        ? ntpEpoch + (uint32_t)((millis() - ntpMillis) / 1000)
+        : (uint32_t)(millis() / 1000);
     logHead = (logHead + 1) % LOG_SIZE;
     if (logCount < LOG_SIZE) logCount++;
 }
 
-static void fmtUptime(unsigned long ms, char* buf, size_t len) {
-    unsigned long s = ms / 1000;
-    snprintf(buf, len, "%02lu:%02lu:%02lu", s / 3600, (s % 3600) / 60, s % 60);
-}
-
 // =====================================================================
-// סוללה
+// Battery
 // =====================================================================
 struct BatteryInfo { int raw; float vbat; int pct; };
 
 BatteryInfo getBatteryInfo() {
     BatteryInfo b;
     b.raw  = analogRead(BAT_ADC);
-    // analogReadMilliVolts uses ESP32 eFuse ADC calibration — far more accurate than raw counts
-    b.vbat = (analogReadMilliVolts(BAT_ADC) / 1000.0f) * 2.0f;  // ×2 for voltage divider
+    b.vbat = (analogReadMilliVolts(BAT_ADC) / 1000.0f) * 2.0f;
     b.pct  = constrain((int)((b.vbat - 3.0f) / 1.2f * 100.0f), 0, 100);
     return b;
 }
 
 int getBatteryPct() { return getBatteryInfo().pct; }
 
-// מחשב מיצוע של מערך דגימות תוך סינון outliers לפי median
 static float filteredBatAverage(float* arr, int n) {
     float s[BAT_SAMPLES];
     memcpy(s, arr, n * sizeof(float));
@@ -227,7 +251,7 @@ static float filteredBatAverage(float* arr, int n) {
 }
 
 // =====================================================================
-// כרטיסים
+// Cards
 // =====================================================================
 void cardAdd(uint32_t code) {
     char key[16]; sprintf(key, "k_%u", code);
@@ -242,7 +266,6 @@ void cardAdd(uint32_t code) {
         if (list.length() > 0) list += ",";
         list += codeStr;
         prefs.putString("cardlist", list);
-        Serial.printf("[CARDS] saved: %s\n", list.c_str());
     }
 }
 
@@ -271,7 +294,6 @@ bool cardExists(uint32_t code) {
 // MQTT
 // =====================================================================
 void mqttPublishDiscovery() {
-    // טמפרטורה
     mqttClient.publish(
         MQTT_PREFIX "/sensor/" MQTT_DEVICE_ID "/temperature/config",
         "{\"name\":\"SmartSafe Temperature\","
@@ -280,22 +302,8 @@ void mqttPublishDiscovery() {
         "\"unit_of_measurement\":\"°C\","
         "\"device_class\":\"temperature\","
         "\"unique_id\":\"sbs_temp\","
-        "\"device\":{\"identifiers\":[\"smartsafe_pro\"],\"name\":\"SmartSafe Pro\",\"model\":\"ESP32\"}}",
+        "\"device\":{\"identifiers\":[\"smartsafe_pro\"],\"name\":\"SmartSafe Pro\",\"model\":\"ESP32-S3\"}}",
         true);
-
-    // לחות
-    mqttClient.publish(
-        MQTT_PREFIX "/sensor/" MQTT_DEVICE_ID "/humidity/config",
-        "{\"name\":\"SmartSafe Humidity\","
-        "\"state_topic\":\"" MQTT_STATE_TOPIC "\","
-        "\"value_template\":\"{{ value_json.hum }}\","
-        "\"unit_of_measurement\":\"%\","
-        "\"device_class\":\"humidity\","
-        "\"unique_id\":\"sbs_hum\","
-        "\"device\":{\"identifiers\":[\"smartsafe_pro\"],\"name\":\"SmartSafe Pro\"}}",
-        true);
-
-    // סוללה
     mqttClient.publish(
         MQTT_PREFIX "/sensor/" MQTT_DEVICE_ID "/battery/config",
         "{\"name\":\"SmartSafe Battery\","
@@ -306,8 +314,6 @@ void mqttPublishDiscovery() {
         "\"unique_id\":\"sbs_battery\","
         "\"device\":{\"identifiers\":[\"smartsafe_pro\"],\"name\":\"SmartSafe Pro\"}}",
         true);
-
-    // מצב נעילה
     mqttClient.publish(
         MQTT_PREFIX "/binary_sensor/" MQTT_DEVICE_ID "/lock/config",
         "{\"name\":\"SmartSafe Lock\","
@@ -319,8 +325,6 @@ void mqttPublishDiscovery() {
         "\"unique_id\":\"sbs_lock\","
         "\"device\":{\"identifiers\":[\"smartsafe_pro\"],\"name\":\"SmartSafe Pro\"}}",
         true);
-
-    // אירועים
     mqttClient.publish(
         MQTT_PREFIX "/sensor/" MQTT_DEVICE_ID "/last_event/config",
         "{\"name\":\"SmartSafe Last Event\","
@@ -328,8 +332,6 @@ void mqttPublishDiscovery() {
         "\"unique_id\":\"sbs_event\","
         "\"device\":{\"identifiers\":[\"smartsafe_pro\"],\"name\":\"SmartSafe Pro\"}}",
         true);
-
-    // boot count
     mqttClient.publish(
         MQTT_PREFIX "/sensor/" MQTT_DEVICE_ID "/boot_count/config",
         "{\"name\":\"SmartSafe Boot Count\","
@@ -339,7 +341,6 @@ void mqttPublishDiscovery() {
         "\"unique_id\":\"sbs_boot\","
         "\"device\":{\"identifiers\":[\"smartsafe_pro\"],\"name\":\"SmartSafe Pro\"}}",
         true);
-
     Serial.println("[MQTT] Discovery published");
 }
 
@@ -380,7 +381,6 @@ void mqttFlushBuffer() {
             (rec.lock_state == 0) ? "true" : "false",
             bootCount, rec.timestamp_s);
         mqttClient.publish(MQTT_STATE_TOPIC, payload, true);
-
         if (rec.event_type == 1) {
             char ev[128];
             snprintf(ev, sizeof(ev),
@@ -422,11 +422,43 @@ bool connectMQTT() {
 }
 
 // =====================================================================
-// HTML Dashboard
+// Motor Control — TB6612FNG + N20 3V @ 5V supply
+// MAX_PWM=150 caps duty at 60% → ~3V effective (protects motor coils)
+// =====================================================================
+void motorForward() {
+    digitalWrite(MOTOR_STBY, HIGH);
+    digitalWrite(MOTOR_AIN1, HIGH);
+    digitalWrite(MOTOR_AIN2, LOW);
+    analogWrite(MOTOR_PWMA, MAX_PWM);
+}
+
+void motorReverse() {
+    digitalWrite(MOTOR_STBY, HIGH);
+    digitalWrite(MOTOR_AIN1, LOW);
+    digitalWrite(MOTOR_AIN2, HIGH);
+    analogWrite(MOTOR_PWMA, MAX_PWM);
+}
+
+void motorStop() {
+    analogWrite(MOTOR_PWMA, 0);
+    digitalWrite(MOTOR_AIN1, LOW);
+    digitalWrite(MOTOR_AIN2, LOW);
+}
+
+void motorStandby() {
+    motorStop();
+    digitalWrite(MOTOR_STBY, LOW);
+}
+
+void motorUnlock() { motorDirSwapped ? motorReverse() : motorForward(); }
+void motorLock()   { motorDirSwapped ? motorForward() : motorReverse(); }
+
+// =====================================================================
+// HTML — Dashboard
 // =====================================================================
 const char HTML_PAGE[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
-<html lang="he" dir="rtl">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
@@ -459,10 +491,14 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(
 .wifi span{width:5px;background:var(--bd);border-radius:2px;transition:background .3s}
 .wifi span:nth-child(1){height:6px}.wifi span:nth-child(2){height:11px}.wifi span:nth-child(3){height:16px}.wifi span:nth-child(4){height:21px}
 .wifi.gd span{background:var(--gr)}.wifi.md span:not(:nth-child(4)){background:var(--yw)}.wifi.wk span:first-child{background:var(--rd)}
+.bat-span{grid-column:span 2}
 .btn-ul{width:100%;padding:15px;background:linear-gradient(135deg,#6366f1,#8b5cf6);border:none;border-radius:12px;color:#fff;font-size:.98rem;font-weight:700;cursor:pointer;transition:all .2s;margin-bottom:10px;letter-spacing:.02em}
 .btn-ul:hover{transform:translateY(-1px);box-shadow:0 8px 25px var(--ag)}
 .btn-ul:active{transform:translateY(0)}
 .btn-ul:disabled{opacity:.45;cursor:not-allowed;transform:none}
+.nav{display:flex;gap:8px;margin-bottom:14px}
+.nav a{flex:1;text-align:center;padding:9px 4px;background:var(--s1);border:1px solid var(--bd);border-radius:10px;color:var(--tm);font-size:.73rem;text-decoration:none;transition:border-color .2s}
+.nav a:hover{border-color:var(--ac);color:var(--tx)}
 .sec{font-size:.68rem;text-transform:uppercase;letter-spacing:.1em;color:var(--tm);margin:18px 0 7px}
 .lst{background:var(--s1);border:1px solid var(--bd);border-radius:12px;overflow:hidden}
 .li{display:flex;align-items:center;justify-content:space-between;padding:11px 14px;border-bottom:1px solid var(--bd);font-size:.83rem}
@@ -484,38 +520,42 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(
 </head>
 <body>
 <div class="hdr">
-  <div><h1>&#128274; SmartSafe Pro</h1><div class="sub" id="uptime">מחכה לנתונים...</div></div>
-  <div class="badge">&#9679; מחובר</div>
+  <div><h1>&#128274; SmartSafe Pro</h1><div class="sub" id="uptime">Loading...</div></div>
+  <div class="badge">&#9679; Connected</div>
 </div>
 <div class="g2">
   <div class="card lock-card">
     <div class="lock-ico lk" id="lIco">&#128274;</div>
-    <div><div class="lock-h2" id="lStat">נעול</div><div class="lock-p" id="lSub">מצב: המתנה</div></div>
+    <div><div class="lock-h2" id="lStat">Locked</div><div class="lock-p" id="lSub">State: Idle</div></div>
   </div>
 </div>
 <div class="g2">
-  <div class="card"><div class="lbl">טמפרטורה</div><div class="val" id="tVal">--</div><div class="sub2">°C</div></div>
-  <div class="card"><div class="lbl">לחות</div><div class="val" id="hVal">N/A</div><div class="sub2">DS18B20</div></div>
-  <div class="card">
-    <div class="lbl">סוללה</div>
-    <div class="val" id="bVal">--%</div>
-    <div class="bat-bar"><div class="bat-fill hi" id="bBar" style="width:0%"></div></div>
-    <div id="bDbg" style="font-family:monospace;font-size:.62rem;color:var(--yw);margin-top:5px;line-height:1.5">raw: --<br>-- V</div>
-  </div>
+  <div class="card"><div class="lbl">Temperature</div><div class="val" id="tVal">--</div><div class="sub2">&#176;C</div></div>
   <div class="card">
     <div class="lbl">WiFi</div>
     <div class="wifi gd" id="wBars"><span></span><span></span><span></span><span></span></div>
     <div class="sub2" id="wRssi">-- dBm</div>
   </div>
+  <div class="card bat-span">
+    <div class="lbl">Battery</div>
+    <div class="val" id="bVal">--%</div>
+    <div class="bat-bar"><div class="bat-fill hi" id="bBar" style="width:0%"></div></div>
+    <div id="bDbg" style="font-family:monospace;font-size:.62rem;color:var(--yw);margin-top:5px;line-height:1.5">raw: --<br>-- V</div>
+  </div>
 </div>
-<button class="btn-ul" id="ulBtn" onclick="doUnlock()">&#128275; פתח דלת</button>
-<div class="sec">כרטיסים מורשים</div>
+<button class="btn-ul" id="ulBtn" onclick="doUnlock()">&#128275; Unlock Door</button>
+<div class="nav">
+  <a href="/monitor">&#128270; Monitor</a>
+  <a href="/graph">&#128200; History</a>
+  <a href="/calib">&#9881; Calibration</a>
+</div>
+<div class="sec">Authorized Cards</div>
 <div class="lst" id="cList"><div class="empty"><span class="spin"></span></div></div>
-<div class="sec">יומן פעילות</div>
+<div class="sec">Activity Log</div>
 <div class="lst" id="lList"><div class="empty"><span class="spin"></span></div></div>
 <div class="toast" id="toast"></div>
 <script>
-const TK='YOUR_API_TOKEN';let cd=false;
+const TK='sbs_secure_99';let cd=false;
 function toast(m,t='in'){const el=document.getElementById('toast');el.textContent=m;el.className='toast sh '+t;setTimeout(()=>el.classList.remove('sh'),3200);}
 async function fetchSt(){
   try{
@@ -523,9 +563,9 @@ async function fetchSt(){
     const lk=d.state!=='LOCK_OPEN';
     const ic=document.getElementById('lIco');
     ic.className='lock-ico '+(lk?'lk':'ul');ic.textContent=lk?'🔒':'🔓';
-    document.getElementById('lStat').textContent=lk?'נעול':'פתוח';
-    const stMap={IDLE:'המתנה',READER_ACTIVE:'קורא פעיל',LOCK_OPEN:'דלת פתוחה'};
-    document.getElementById('lSub').textContent='מצב: '+(stMap[d.state]||d.state);
+    document.getElementById('lStat').textContent=lk?'Locked':'Unlocked';
+    const stMap={IDLE:'Idle',READER_ACTIVE:'Reader Active',LOCK_OPEN:'Door Open'};
+    document.getElementById('lSub').textContent='State: '+(stMap[d.state]||d.state);
     document.getElementById('tVal').textContent=(d.temp>-40)?d.temp.toFixed(1):'ERR';
     const b=Math.min(100,Math.max(0,d.battery));
     document.getElementById('bVal').textContent=b+'%';
@@ -536,25 +576,26 @@ async function fetchSt(){
     const wb=document.getElementById('wBars');
     wb.className='wifi '+(d.rssi>-60?'gd':d.rssi>-75?'md':'wk');
     const s=d.uptime,h=Math.floor(s/3600),m=Math.floor((s%3600)/60);
-    document.getElementById('uptime').textContent='פעיל: '+(h?h+'ש׳ ':'')+m+'ד׳';
+    document.getElementById('uptime').textContent='Uptime: '+(h?h+'h ':'')+m+'m';
   }catch(e){}
 }
 async function fetchCards(){
   try{
     const d=await(await fetch('/api/cards')).json();
     const el=document.getElementById('cList');
-    if(!d.cards||!d.cards.length){el.innerHTML='<div class="empty">אין כרטיסים רשומים</div>';return;}
-    el.innerHTML=d.cards.map(c=>`<div class="li"><div><div>כרטיס RFID</div><div class="id">#${c}</div></div><button class="btn-del" onclick="delCard('${c}')">הסר</button></div>`).join('');
+    if(!d.cards||!d.cards.length){el.innerHTML='<div class="empty">No cards registered</div>';return;}
+    el.innerHTML=d.cards.map(c=>`<div class="li"><div><div>RFID Card</div><div class="id">#${c}</div></div><button class="btn-del" onclick="delCard('${c}')">Remove</button></div>`).join('');
   }catch(e){}
 }
 async function fetchLog(){
   try{
     const d=await(await fetch('/api/log')).json();
     const el=document.getElementById('lList');
-    if(!d.log||!d.log.length){el.innerHTML='<div class="empty">אין אירועים</div>';return;}
+    if(!d.log||!d.log.length){el.innerHTML='<div class="empty">No events</div>';return;}
     el.innerHTML=d.log.map(e=>{
-      const c=e.msg.includes('נפתח')||e.msg.includes('Open')?'ok':e.msg.includes('נדחה')||e.msg.includes('Denied')||e.msg.includes('Invalid')?'er':'in';
-      return`<div class="log-it ${c}"><div class="log-t">${e.time}</div><div class="log-m">${e.msg}</div></div>`;
+      const c=e.msg.includes('Opened')||e.msg.includes('open')?'ok':e.msg.includes('Denied')||e.msg.includes('denied')||e.msg.includes('Invalid')?'er':'in';
+      const t=e.ts>86400?new Date(e.ts*1000).toLocaleTimeString():('0'+Math.floor(e.ts/3600)).slice(-2)+':'+('0'+Math.floor((e.ts%3600)/60)).slice(-2)+':'+('0'+(e.ts%60)).slice(-2);
+      return`<div class="log-it ${c}"><div class="log-t">${t}</div><div class="log-m">${e.msg}</div></div>`;
     }).join('');
   }catch(e){}
 }
@@ -562,18 +603,18 @@ async function doUnlock(){
   if(cd)return;const btn=document.getElementById('ulBtn');btn.disabled=true;cd=true;
   try{
     const r=await fetch('/open?t='+TK);
-    if(r.ok){toast('הדלת נפתחה!','ok');setTimeout(()=>{fetchSt();fetchLog();},600);}
-    else if(r.status===429)toast('ממתין לcooldown...','er');
-    else toast('שגיאה בפתיחה','er');
-  }catch(e){toast('שגיאת חיבור','er');}
+    if(r.ok){toast('Door unlocked!','ok');setTimeout(()=>{fetchSt();fetchLog();},600);}
+    else if(r.status===429)toast('Cooldown active...','er');
+    else toast('Unlock failed','er');
+  }catch(e){toast('Connection error','er');}
   setTimeout(()=>{btn.disabled=false;cd=false;},3000);
 }
 async function delCard(id){
-  if(!confirm('למחוק כרטיס #'+id+'?'))return;
+  if(!confirm('Delete card #'+id+'?'))return;
   try{
     const r=await fetch('/api/cards/delete?id='+id,{method:'POST'});
-    if(r.ok){toast('כרטיס הוסר','ok');fetchCards();}else toast('שגיאה','er');
-  }catch(e){toast('שגיאת חיבור','er');}
+    if(r.ok){toast('Card removed','ok');fetchCards();}else toast('Error','er');
+  }catch(e){toast('Connection error','er');}
 }
 fetchSt();fetchCards();fetchLog();
 setInterval(fetchSt,5000);setInterval(fetchLog,10000);setInterval(fetchCards,8000);
@@ -582,13 +623,114 @@ setInterval(fetchSt,5000);setInterval(fetchLog,10000);setInterval(fetchCards,800
 </html>
 )rawliteral";
 
-const char MONITOR_PAGE[] PROGMEM = R"rawliteral(
+// =====================================================================
+// HTML — History Graph
+// =====================================================================
+const char GRAPH_PAGE[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
-<html lang="he" dir="rtl">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
-<title>Monitor — SmartSafe</title>
+<title>History &#8212; SmartSafe</title>
+<style>
+:root{--bg:#0a0a14;--s1:#13131f;--bd:#2a2a45;--ac:#6366f1;--gr:#10b981;--cy:#06b6d4;--tx:#e2e8f0;--tm:#64748b}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--tx);min-height:100vh;padding:16px;max-width:520px;margin:0 auto}
+.hdr{display:flex;align-items:center;justify-content:space-between;padding:14px 0 20px;border-bottom:1px solid var(--bd);margin-bottom:16px}
+.hdr h1{font-size:1.15rem;font-weight:700}.hdr .sub{color:var(--tm);font-size:.68rem;margin-top:2px}
+.back{color:var(--ac);font-size:.78rem;text-decoration:none;padding:5px 11px;border:1px solid var(--bd);border-radius:8px}
+.card{background:var(--s1);border:1px solid var(--bd);border-radius:12px;padding:16px;margin-bottom:12px}
+.chart-lbl{font-size:.65rem;text-transform:uppercase;letter-spacing:.1em;color:var(--tm);margin-bottom:10px}
+svg{width:100%;display:block;overflow:visible}
+.empty{padding:32px;text-align:center;color:var(--tm);font-size:.82rem}
+.stats{display:flex;gap:20px;margin-top:8px;flex-wrap:wrap}
+.stat{font-size:.72rem;color:var(--tm)}
+.stat b{color:var(--tx);font-weight:600;margin-left:3px}
+</style>
+</head>
+<body>
+<div class="hdr">
+  <div><h1>&#128200; History</h1><div class="sub" id="subEl">Loading...</div></div>
+  <a href="/" class="back">&#8592; Dashboard</a>
+</div>
+<div class="card">
+  <div class="chart-lbl">Temperature (&#176;C)</div>
+  <div id="tChart"><div class="empty">Loading...</div></div>
+  <div class="stats" id="tStats"></div>
+</div>
+<div class="card">
+  <div class="chart-lbl">Battery (%)</div>
+  <div id="bChart"><div class="empty">Loading...</div></div>
+  <div class="stats" id="bStats"></div>
+</div>
+<script>
+const PL=34,PR=8,PT=8,PB=22,IH=100,W=460,IW=W-PL-PR;
+function chart(pts,yLo,yHi,stroke,unit){
+  if(!pts||pts.length<2)return'<div class="empty">Not enough data</div>';
+  const n=pts.length;
+  const xS=i=>(PL+i/(n-1)*IW).toFixed(1);
+  const yS=v=>(PT+IH-(v-yLo)/(yHi-yLo||1)*IH).toFixed(1);
+  const steps=4;let g='';
+  for(let i=0;i<=steps;i++){
+    const v=yLo+(yHi-yLo)/steps*i,y=(PT+IH-(v-yLo)/(yHi-yLo||1)*IH).toFixed(1);
+    g+=`<line x1="${PL}" y1="${y}" x2="${W-PR}" y2="${y}" stroke="#2a2a45" stroke-width="1"/>`;
+    g+=`<text x="${PL-4}" y="${(parseFloat(y)+3.5).toFixed(1)}" text-anchor="end" font-size="9" fill="#64748b">${unit==='%'?v.toFixed(0):v.toFixed(1)}</text>`;
+  }
+  const tStep=Math.max(1,Math.floor(n/5));
+  for(let i=0;i<n;i+=tStep){
+    const p=pts[i],x=xS(i);
+    const lbl=p.ts>86400?(()=>{const d=new Date(p.ts*1000);return d.getHours().toString().padStart(2,'0')+':'+d.getMinutes().toString().padStart(2,'0');})():(Math.floor(p.ts/3600)+'h');
+    g+=`<text x="${x}" y="${PT+IH+14}" text-anchor="middle" font-size="9" fill="#64748b">${lbl}</text>`;
+  }
+  let area=`M${xS(0)},${yS(pts[0].v)}`,line=`M${xS(0)},${yS(pts[0].v)}`;
+  for(let i=1;i<n;i++){area+=` L${xS(i)},${yS(pts[i].v)}`;line+=` L${xS(i)},${yS(pts[i].v)}`;}
+  area+=` L${xS(n-1)},${(PT+IH).toFixed(1)} L${xS(0)},${(PT+IH).toFixed(1)} Z`;
+  const lx=xS(n-1),ly=yS(pts[n-1].v);
+  return`<svg viewBox="0 0 ${W} ${PT+IH+PB}" xmlns="http://www.w3.org/2000/svg">${g}<path d="${area}" fill="${stroke}" fill-opacity=".07"/><path d="${line}" fill="none" stroke="${stroke}" stroke-width="1.5" stroke-linejoin="round"/><circle cx="${lx}" cy="${ly}" r="3" fill="${stroke}"/></svg>`;
+}
+async function load(){
+  try{
+    const d=await(await fetch('/api/graph')).json();
+    if(!d||!d.length){
+      document.getElementById('tChart').innerHTML='<div class="empty">No data yet &#8212; recorded every 10 min</div>';
+      document.getElementById('bChart').innerHTML='<div class="empty">No data yet</div>';
+      document.getElementById('subEl').textContent='0 points';return;
+    }
+    document.getElementById('subEl').textContent=d.length+' point'+(d.length===1?'':'s')+' · up to 24h';
+    const tp=d.filter(p=>p.temp!==null).map(p=>({ts:p.ts,v:p.temp}));
+    if(tp.length>=2){
+      const vs=tp.map(p=>p.v),mn=Math.min(...vs),mx=Math.max(...vs),pad=Math.max(.5,(mx-mn)*.15);
+      document.getElementById('tChart').innerHTML=chart(tp,mn-pad,mx+pad,'#06b6d4','C');
+      const last=tp[tp.length-1];
+      document.getElementById('tStats').innerHTML=`<div class="stat">Now<b>${last.v.toFixed(1)}&#176;C</b></div><div class="stat">Min<b>${mn.toFixed(1)}&#176;C</b></div><div class="stat">Max<b>${mx.toFixed(1)}&#176;C</b></div>`;
+    }else document.getElementById('tChart').innerHTML='<div class="empty">Not enough data</div>';
+    const bp=d.map(p=>({ts:p.ts,v:p.bat}));
+    const bvs=bp.map(p=>p.v),bmn=Math.max(0,Math.min(...bvs)-5),bmx=Math.min(100,Math.max(...bvs)+5);
+    document.getElementById('bChart').innerHTML=chart(bp,bmn,bmx,'#10b981','%');
+    const blast=bp[bp.length-1];
+    document.getElementById('bStats').innerHTML=`<div class="stat">Now<b>${blast.v}%</b></div><div class="stat">Min<b>${Math.min(...bvs)}%</b></div><div class="stat">Max<b>${Math.max(...bvs)}%</b></div>`;
+  }catch(e){
+    document.getElementById('tChart').innerHTML='<div class="empty">Failed to load</div>';
+    document.getElementById('bChart').innerHTML='<div class="empty">Failed to load</div>';
+  }
+}
+load();setInterval(load,60000);
+</script>
+</body>
+</html>
+)rawliteral";
+
+// =====================================================================
+// HTML — Monitor
+// =====================================================================
+const char MONITOR_PAGE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>Monitor &#8212; SmartSafe</title>
 <style>
 :root{--bg:#0a0a14;--s1:#13131f;--bd:#2a2a45;--ac:#6366f1;--gr:#10b981;--rd:#ef4444;--yw:#f59e0b;--cy:#06b6d4;--tx:#e2e8f0;--tm:#64748b}
 *{box-sizing:border-box;margin:0;padding:0}
@@ -598,7 +740,6 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(
 .back{color:var(--ac);font-size:.78rem;text-decoration:none;padding:5px 11px;border:1px solid var(--bd);border-radius:8px}
 .sec{font-size:.62rem;text-transform:uppercase;letter-spacing:.1em;color:var(--tm);margin:14px 0 6px}
 .card{background:var(--s1);border:1px solid var(--bd);border-radius:12px;padding:14px;margin-bottom:8px}
-.g2{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px}
 .lbl{color:var(--tm);font-size:.6rem;text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px}
 .val{font-size:1.35rem;font-weight:700;font-family:monospace}
 .row{display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid rgba(42,42,69,.6);font-size:.8rem}
@@ -635,68 +776,61 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(
 <body>
 <div class="hdr">
   <div><h1>&#128270; SmartSafe Monitor</h1><div class="sub" id="upEl">--</div></div>
-  <a href="/" class="back">&#8592; דשבורד</a>
+  <a href="/" class="back">&#8592; Dashboard</a>
 </div>
-
-<div class="sec">מצב מכונה</div>
+<div class="sec">System State</div>
 <div class="card" style="display:flex;align-items:center;gap:14px">
   <span id="stBadge" class="badge idle">IDLE</span>
-  <span id="stDesc" style="color:var(--tm);font-size:.82rem">המתנה</span>
+  <span id="stDesc" style="color:var(--tm);font-size:.82rem">Idle</span>
 </div>
-
-<div class="sec">סריקת RFID</div>
+<div class="sec">RFID Scan</div>
 <div class="card">
-  <div class="lbl" style="display:flex;align-items:center;gap:6px">מזהה שנסרק <span class="dot off" id="scanDot"></span></div>
+  <div class="lbl" style="display:flex;align-items:center;gap:6px">Last scanned ID <span class="dot off" id="scanDot"></span></div>
   <div class="code-big" id="rfidCode">---</div>
-  <div class="bits-sub" id="rfidBits">לא פעיל</div>
+  <div class="bits-sub" id="rfidBits">Not active</div>
 </div>
-
-<div class="sec">חיישן DS18B20 — טמפרטורה (OneWire, GPIO16)</div>
-<div class="g2">
-  <div class="card"><div class="lbl">טמפרטורה</div><div class="val" id="tRaw">--</div><div style="color:var(--tm);font-size:.68rem;margin-top:3px">°C</div></div>
-  <div class="card"><div class="lbl">לחות</div><div class="val" id="hRaw">N/A</div><div style="color:var(--tm);font-size:.68rem;margin-top:3px">DS18B20</div></div>
+<div class="sec">DS18B20 &#8212; Temperature (OneWire, GPIO16)</div>
+<div class="card">
+  <div class="lbl">Temperature</div>
+  <div class="val" id="tRaw">--</div>
+  <div style="color:var(--tm);font-size:.68rem;margin-top:3px">&#176;C</div>
+  <div class="row" style="margin-top:8px"><span style="color:var(--tm)">Last read age</span><span class="mono" id="dhtAge">--</span></div>
+</div>
+<div class="sec">Battery &#8212; Raw &amp; Computed</div>
+<div class="card">
+  <div class="lbl">Live ADC reading</div>
+  <div class="row"><span>ADC Raw (0&#8211;4095)</span><span class="mono" style="color:var(--yw)" id="batRaw">--</span></div>
+  <div class="row"><span>Computed voltage</span><span class="mono" style="color:var(--cy)" id="batV">--</span></div>
+  <div class="row"><span>Battery %</span><span class="mono" id="batPct">--</span></div>
 </div>
 <div class="card">
-  <div class="row"><span style="color:var(--tm)">גיל קריאה אחרונה</span><span class="mono" id="dhtAge">--</span></div>
-</div>
-
-<div class="sec">מדידת סוללה — נתונים גולמיים ומחושבים</div>
-<div class="card">
-  <div class="lbl">קריאה חיה מה-ADC</div>
-  <div class="row"><span>ADC Raw (0–4095)</span><span class="mono" style="color:var(--yw)" id="batRaw">--</span></div>
-  <div class="row"><span>מתח מחושב<span style="color:var(--tm);font-size:.68rem"> (raw/4095×3.3×2)</span></span><span class="mono" style="color:var(--cy)" id="batV">--</span></div>
-  <div class="row"><span>אחוז מחושב<span style="color:var(--tm);font-size:.68rem"> ((V-3.0)/1.2×100)</span></span><span class="mono" id="batPct">--</span></div>
-</div>
-<div class="card">
-  <div class="lbl">חלון דגימות — 6 × 10 שניות</div>
+  <div class="lbl">Sample window &#8212; 6 &#215; 10 seconds</div>
   <div id="slotsEl"></div>
   <div class="avg-row">
     <span class="avg-v" id="avgV">--</span>
-    <span class="avg-pct" id="avgPct">ממתין לדגימות...</span>
+    <span class="avg-pct" id="avgPct">Waiting for samples...</span>
   </div>
 </div>
-
-<div class="sec">מפתחות שמורים</div>
-<div class="card" id="cardsEl"><div class="empty">טוען...</div></div>
-
+<div class="sec">Stored Keys</div>
+<div class="card" id="cardsEl"><div class="empty">Loading...</div></div>
 <script>
 const stMap={
-  IDLE:{label:'IDLE',cls:'idle',desc:'המתנה'},
-  READER_ACTIVE:{label:'READER ACTIVE',cls:'active',desc:'קורא RFID פעיל'},
-  LOCK_OPEN:{label:'LOCK OPEN',cls:'open',desc:'דלת פתוחה'}
+  IDLE:{label:'IDLE',cls:'idle',desc:'Idle'},
+  READER_ACTIVE:{label:'READER ACTIVE',cls:'active',desc:'RFID reader active'},
+  LOCK_OPEN:{label:'LOCK OPEN',cls:'open',desc:'Door open'}
 };
-function fmtUp(s){const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=s%60;return(h?h+'ש׳ ':'')+m+'ד׳ '+sec+'ש"';}
+function fmtUp(s){const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=s%60;return(h?h+'h ':'')+m+'m '+sec+'s';}
 async function refresh(){
   try{
     const d=await(await fetch('/api/monitor')).json();
-    document.getElementById('upEl').textContent='פעיל: '+fmtUp(d.uptime);
+    document.getElementById('upEl').textContent='Uptime: '+fmtUp(d.uptime);
     const sm=stMap[d.state]||{label:d.state,cls:'idle',desc:''};
     const b=document.getElementById('stBadge');b.textContent=sm.label;b.className='badge '+sm.cls;
     document.getElementById('stDesc').textContent=sm.desc;
     const sc=d.rfid.scanning;
     document.getElementById('scanDot').className='dot '+(sc?'on':'off');
     document.getElementById('rfidCode').textContent=(sc&&d.rfid.bits>0)?String(d.rfid.code):'---';
-    document.getElementById('rfidBits').textContent=(sc&&d.rfid.bits>0)?(d.rfid.bits+' bits'):'לא פעיל';
+    document.getElementById('rfidBits').textContent=(sc&&d.rfid.bits>0)?(d.rfid.bits+' bits'):'Not active';
     document.getElementById('tRaw').textContent=d.dht.temp!==null?d.dht.temp.toFixed(2):'ERR';
     document.getElementById('dhtAge').textContent=(d.dht.age_ms/1000).toFixed(1)+'s';
     document.getElementById('batRaw').textContent=d.bat_live.raw;
@@ -707,40 +841,37 @@ async function refresh(){
     for(let i=0;i<6;i++){
       const v=sl[i],has=v>0.5,isNext=i===idx;
       const pct=has?Math.max(0,Math.min(100,Math.round((v-3.0)/1.2*100))):null;
-      html+=`<div class="slot">
-        <span class="slot-n">${i+1}</span>
-        <span class="slot-v${has?'':' empty'}">${has?v.toFixed(3)+' V':'---'}</span>
-        <span class="slot-pct">${pct!==null?pct+'%':''}</span>
-        <span class="slot-tag${isNext?' next':has?' ok':''}">${isNext?'← הבא':has?'✓':''}</span>
-      </div>`;
+      html+=`<div class="slot"><span class="slot-n">${i+1}</span><span class="slot-v${has?'':' empty'}">${has?v.toFixed(3)+' V':'---'}</span><span class="slot-pct">${pct!==null?pct+'%':''}</span><span class="slot-tag${isNext?' next':has?' ok':''}">${isNext?'&#8592; next':has?'&#10003;':''}</span></div>`;
     }
     document.getElementById('slotsEl').innerHTML=html;
     if(ready&&d.bat_avg_v!=null){
       document.getElementById('avgV').textContent=d.bat_avg_v.toFixed(3)+' V';
-      document.getElementById('avgPct').textContent='ממוצע מסונן · '+d.bat_avg_pct+'%';
-    } else {
+      document.getElementById('avgPct').textContent='Filtered avg · '+d.bat_avg_pct+'%';
+    }else{
       document.getElementById('avgV').textContent='--';
-      document.getElementById('avgPct').textContent='ממתין לדגימות ('+(ready?6:idx)+'/6)...';
+      document.getElementById('avgPct').textContent='Waiting ('+(ready?6:idx)+'/6 samples)...';
     }
     const cards=d.cards,cel=document.getElementById('cardsEl');
-    if(!cards||!cards.length)cel.innerHTML='<div class="empty">אין מפתחות שמורים</div>';
-    else cel.innerHTML=cards.map((c,i)=>`<div class="card-item"><span>מפתח ${i+1}</span><span class="card-id">#${c}</span></div>`).join('');
+    if(!cards||!cards.length)cel.innerHTML='<div class="empty">No stored keys</div>';
+    else cel.innerHTML=cards.map((c,i)=>`<div class="card-item"><span>Key ${i+1}</span><span class="card-id">#${c}</span></div>`).join('');
   }catch(e){console.error(e);}
 }
-refresh();
-setInterval(refresh,1000);
+refresh();setInterval(refresh,1000);
 </script>
 </body>
 </html>
 )rawliteral";
 
+// =====================================================================
+// HTML — Motor Calibration
+// =====================================================================
 const char CALIB_PAGE[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
-<html lang="he" dir="rtl">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
-<title>כיול סרוו</title>
+<title>Motor Calibration &#8212; SmartSafe</title>
 <style>
 :root{--bg:#0a0a14;--s1:#13131f;--bd:#2a2a45;--ac:#6366f1;--gr:#10b981;--rd:#ef4444;--yw:#f59e0b;--tx:#e2e8f0;--tm:#64748b}
 *{box-sizing:border-box;margin:0;padding:0}
@@ -774,50 +905,50 @@ input[type=number]{width:100%;padding:10px 12px;background:var(--bg);border:1px 
 </head>
 <body>
 <div class="hdr">
-  <div><h1>&#9881; כיול סרוו</h1></div>
-  <a href="/" class="back">&#8592; דשבורד</a>
+  <div><h1>&#9881; Motor Calibration</h1></div>
+  <a href="/" class="back">&#8592; Dashboard</a>
 </div>
 
-<div class="step-num">שלב 1</div>
-<div class="sec">בדוק כיוונים</div>
+<div class="step-num">Step 1</div>
+<div class="sec">Test directions</div>
 <div class="card">
-  <div class="lbl">משך בדיקה</div>
-  <div class="ms-big" id="msDsp">600ms</div>
-  <input type="range" id="msSlider" min="100" max="2000" step="50" value="600"
+  <div class="lbl">Test duration</div>
+  <div class="ms-big" id="msDsp">1000ms</div>
+  <input type="range" id="msSlider" min="100" max="2000" step="50" value="1000"
          oninput="document.getElementById('msDsp').textContent=this.value+'ms'">
   <div class="row">
-    <button class="btn ba" onclick="spin(3276)">&#8635; כיוון A</button>
-    <button class="btn bb" onclick="spin(6553)">&#8634; כיוון B</button>
-    <button class="btn bstop" onclick="doStop()" title="עצור">&#9632;</button>
+    <button class="btn ba" onclick="runDir('fwd')">&#9654; Direction A (Forward)</button>
+    <button class="btn bb" onclick="runDir('rev')">&#9654; Direction B (Reverse)</button>
+    <button class="btn bstop" onclick="doStop()" title="Stop">&#9632;</button>
   </div>
 </div>
 
-<div class="step-num">שלב 2</div>
-<div class="sec">הגדר מה פותח</div>
+<div class="step-num">Step 2</div>
+<div class="sec">Set open direction</div>
 <div class="card">
-  <div class="lbl">לאחר שזיהית — בחר איזה כיוון פותח את הנעל</div>
+  <div class="lbl">Select which direction opens the lock</div>
   <div class="row">
-    <button class="btn ba" onclick="setDir('A')">A = פתיחה &#10003;</button>
-    <button class="btn bb" onclick="setDir('B')">B = פתיחה &#10003;</button>
+    <button class="btn ba" onclick="setDir('A')">A = Open &#10003;</button>
+    <button class="btn bb" onclick="setDir('B')">B = Open &#10003;</button>
   </div>
-  <div id="dirChip"><span class="chip chip-none">לא הוגדר עדיין</span></div>
+  <div id="dirChip"><span class="chip chip-none">Not set yet</span></div>
 </div>
 
-<div class="step-num">שלב 3</div>
-<div class="sec">כוונן משך הסיבוב</div>
+<div class="step-num">Step 3</div>
+<div class="sec">Tune duration</div>
 <div class="card">
-  <div class="lbl">ms עד שהתפס מגיע לסוף — הגדל אם לא מספיק, הקטן אם המנוע נשאר בלחץ</div>
-  <input type="number" id="saveMs" min="100" max="3000" step="50" value="600">
+  <div class="lbl">ms until latch reaches end — increase if incomplete, decrease if motor stalls under pressure</div>
+  <input type="number" id="saveMs" min="100" max="3000" step="50" value="1000">
   <div class="row">
-    <button class="btn bopen" id="btnOpen" onclick="testAction('open')" disabled>&#9654; בדוק פתיחה</button>
-    <button class="btn bstop" id="btnClose" onclick="testAction('close')" disabled style="flex:1">&#9654; בדוק נעילה</button>
+    <button class="btn bopen" id="btnOpen" onclick="testAction('open')" disabled>&#9654; Test Open</button>
+    <button class="btn bstop" id="btnClose" onclick="testAction('close')" disabled style="flex:1">&#9654; Test Close</button>
   </div>
 </div>
 
-<div class="step-num">שלב 4</div>
-<div class="sec">שמור לפלאש</div>
+<div class="step-num">Step 4</div>
+<div class="sec">Save to flash</div>
 <div class="card">
-  <button class="bsave" id="btnSave" onclick="save()" disabled>&#128190; שמור כיול</button>
+  <button class="bsave" id="btnSave" onclick="save()" disabled>&#128190; Save Calibration</button>
   <div id="saveMsg"></div>
 </div>
 
@@ -826,25 +957,25 @@ let unlockDir=null;
 function ms(){return parseInt(document.getElementById('msSlider').value);}
 function sms(){return parseInt(document.getElementById('saveMs').value);}
 async function api(p){try{const r=await fetch('/api/calib?'+p);return await r.json();}catch(e){return{ok:false};}}
-function spin(d){api('cmd=spin&duty='+d+'&ms='+ms());}
+function runDir(d){api('cmd='+d+'&ms='+ms());}
 function doStop(){api('cmd=stop');}
 function setDir(d){
   unlockDir=d;
-  document.getElementById('dirChip').innerHTML='<span class="chip chip-ok">כיוון '+d+' = פתיחה &#10003;</span>';
+  document.getElementById('dirChip').innerHTML='<span class="chip chip-ok">Direction '+d+' = Open &#10003;</span>';
   document.getElementById('btnOpen').disabled=false;
   document.getElementById('btnClose').disabled=false;
   document.getElementById('btnSave').disabled=false;
 }
 function testAction(a){
-  const d=(a==='open')?(unlockDir==='A'?3276:6553):(unlockDir==='A'?6553:3276);
-  api('cmd=spin&duty='+d+'&ms='+sms());
+  const isFwd=(a==='open')?(unlockDir==='A'):(unlockDir==='B');
+  api('cmd='+(isFwd?'fwd':'rev')+'&ms='+sms());
 }
 async function save(){
   const r=await api('cmd=save&dir='+unlockDir+'&ms='+sms());
   const el=document.getElementById('saveMsg');
   el.innerHTML=r&&r.ok
-    ?'<div class="msg msg-ok">&#10003; נשמר! כיוון '+unlockDir+' פותח &middot; '+sms()+'ms</div>'
-    :'<div class="msg msg-er">&#10007; שגיאה בשמירה</div>';
+    ?'<div class="msg msg-ok">&#10003; Saved! Direction '+unlockDir+' opens &middot; '+sms()+'ms</div>'
+    :'<div class="msg msg-er">&#10007; Save failed</div>';
 }
 </script>
 </body>
@@ -852,12 +983,18 @@ async function save(){
 )rawliteral";
 
 // =====================================================================
-// ISR
+// ISR — Wiegand RFID
 // =====================================================================
-void IRAM_ATTR rfid_isr() {
+void IRAM_ATTR rfid_isr_d0() {
     if (currentState != READER_ACTIVE) return;
-    int bit = (digitalRead(D1_PIN) == LOW) ? 1 : 0;
-    v_rfid.code = (v_rfid.code << 1) | bit;
+    v_rfid.code = (v_rfid.code << 1);      // bit 0
+    v_rfid.bits++;
+    v_rfid.lastMicros = micros();
+}
+
+void IRAM_ATTR rfid_isr_d1() {
+    if (currentState != READER_ACTIVE) return;
+    v_rfid.code = (v_rfid.code << 1) | 1;  // bit 1
     v_rfid.bits++;
     v_rfid.lastMicros = micros();
 }
@@ -866,39 +1003,28 @@ void IRAM_ATTR rfid_isr() {
 // FSM
 // =====================================================================
 void setSystemState(SystemState newState) {
-    currentState = newState;
-    stateTimer   = millis();
+    currentState  = newState;
+    stateTimer    = millis();
     activityTimer = millis();
+
     if (newState == IDLE) {
         digitalWrite(BOOST_12V_EN_PIN, LOW);
-        if (firstBootCalib) {
-            firstBootCalib = false;
-            Serial.println("[INIT] Startup calibration: opening...");
-            ledcWrite(SERVO_CH, servoUnlockDuty);
-            delay(servoMoveMs);
-            ledcWrite(SERVO_CH, 0);
-            Serial.println("[INIT] Waiting 10 seconds...");
-            delay(10000);
-            Serial.println("[INIT] Calibration done — locking...");
-        }
-        ledcWrite(SERVO_CH, servoLockDuty);
-        delay(servoMoveMs);
-        ledcWrite(SERVO_CH, 0);
+        motorLock();
+        motorStopAt = millis() + motorMoveMs;
         editMode = false;
-        Serial.println("[FSM] IDLE");
+        Serial.println("[FSM] IDLE — locking");
     } else if (newState == READER_ACTIVE) {
         digitalWrite(BOOST_12V_EN_PIN, HIGH);
         boosterStartTime = millis();
         noInterrupts(); v_rfid.bits = 0; v_rfid.code = 0; interrupts();
-        addLog("קורא RFID הופעל");
+        addLog("RFID reader activated");
         Serial.println("[FSM] READER_ACTIVE");
     } else if (newState == LOCK_OPEN) {
-        ledcWrite(SERVO_CH, servoUnlockDuty);
-        delay(servoMoveMs);
-        ledcWrite(SERVO_CH, 0);
+        motorUnlock();
+        motorStopAt = millis() + motorMoveMs;
         digitalWrite(BOOST_12V_EN_PIN, LOW);
         lastUnlockTime = millis();
-        Serial.println("[FSM] LOCK_OPEN");
+        Serial.println("[FSM] LOCK_OPEN — unlocking");
     }
 }
 
@@ -918,7 +1044,7 @@ void setupServerRoutes() {
             if (millis() - lastUnlockTime > LOCK_COOLDOWN_MS) {
                 setSystemState(LOCK_OPEN);
                 activityTimer = millis();
-                addLog("נפתח מרחוק (ווב)");
+                addLog("Opened via web");
                 rtcAddRecord(cachedTemp, cachedHum, getBatteryPct(), 2, 2);
                 if (mqttClient.connected()) {
                     mqttPublishEvent("web_open");
@@ -929,7 +1055,7 @@ void setupServerRoutes() {
                 req->send(429, "text/plain", "Cooldown");
             }
         } else {
-            addLog("ניסיון פתיחה עם טוקן שגוי");
+            addLog("Invalid token attempt");
             req->send(403, "text/plain", "Invalid Token");
         }
     });
@@ -938,9 +1064,8 @@ void setupServerRoutes() {
         if (!req->authenticate(www_username, www_password)) return req->requestAuthentication();
         activityTimer = millis();
         BatteryInfo bat = getBatteryInfo();
-        // עדיפות לערך ממוצע מסונן; fallback לקריאה חיה לפני שיש מספיק דגימות
-        int   dispPct  = (batPctAvg >= 0)    ? batPctAvg : bat.pct;
-        float dispVolt = !isnan(batVAvg)     ? batVAvg   : bat.vbat;
+        int   dispPct  = (batPctAvg >= 0)  ? batPctAvg : bat.pct;
+        float dispVolt = !isnan(batVAvg)   ? batVAvg   : bat.vbat;
         int   rssi = WiFi.RSSI();
         const char* st = currentState == LOCK_OPEN     ? "LOCK_OPEN"
                        : currentState == READER_ACTIVE ? "READER_ACTIVE" : "IDLE";
@@ -981,7 +1106,7 @@ void setupServerRoutes() {
         uint32_t code = (uint32_t)req->getParam("id")->value().toInt();
         if (!cardExists(code)) { req->send(404, "text/plain", "Not found"); return; }
         cardRemove(code);
-        char buf[48]; snprintf(buf, sizeof(buf), "כרטיס #%u הוסר (ווב)", code);
+        char buf[48]; snprintf(buf, sizeof(buf), "Card #%u removed (web)", code);
         addLog(buf);
         req->send(200, "text/plain", "OK");
     });
@@ -992,13 +1117,35 @@ void setupServerRoutes() {
         int cnt = min(logCount, LOG_SIZE); bool first = true;
         for (int i = cnt - 1; i >= 0; i--) {
             int idx = ((logHead - 1 - i) % LOG_SIZE + LOG_SIZE) % LOG_SIZE;
-            char tb[12]; fmtUptime(actLog[idx].ts, tb, sizeof(tb));
             if (!first) json += ",";
-            json += "{\"time\":\""; json += tb;
-            json += "\",\"msg\":\""; json += actLog[idx].msg; json += "\"}";
+            json += "{\"ts\":";    json += actLog[idx].ts;
+            json += ",\"msg\":\""; json += actLog[idx].msg; json += "\"}";
             first = false;
         }
         json += "]}";
+        req->send(200, "application/json", json);
+    });
+
+    server.on("/graph", HTTP_GET, [](AsyncWebServerRequest *req) {
+        if (!req->authenticate(www_username, www_password)) return req->requestAuthentication();
+        req->send_P(200, "text/html", GRAPH_PAGE);
+    });
+
+    server.on("/api/graph", HTTP_GET, [](AsyncWebServerRequest *req) {
+        if (!req->authenticate(www_username, www_password)) return req->requestAuthentication();
+        String json = "[";
+        for (int i = 0; i < graphCount; i++) {
+            int idx = graphGetIdx(i);
+            GraphPoint& p = graphBuf[idx];
+            if (i > 0) json += ",";
+            json += "{\"ts\":";   json += p.ts;
+            json += ",\"temp\":";
+            if (p.temp10 == -9990) json += "null";
+            else json += String(p.temp10 / 10.0f, 1);
+            json += ",\"bat\":";  json += p.bat_pct;
+            json += "}";
+        }
+        json += "]";
         req->send(200, "application/json", json);
     });
 
@@ -1016,27 +1163,30 @@ void setupServerRoutes() {
         if (!req->authenticate(www_username, www_password)) return req->requestAuthentication();
         String cmd = req->hasParam("cmd") ? req->getParam("cmd")->value() : "";
 
-        if (cmd == "spin") {
-            uint32_t duty = req->hasParam("duty") ? (uint32_t)req->getParam("duty")->value().toInt() : 0;
+        if (cmd == "fwd") {
             int ms = req->hasParam("ms") ? constrain(req->getParam("ms")->value().toInt(), 50, 3000) : 600;
-            ledcWrite(SERVO_CH, duty);
-            calibStopAt = millis() + ms;
+            motorForward();
+            motorStopAt = millis() + ms;
+            req->send(200, "application/json", "{\"ok\":true}");
+
+        } else if (cmd == "rev") {
+            int ms = req->hasParam("ms") ? constrain(req->getParam("ms")->value().toInt(), 50, 3000) : 600;
+            motorReverse();
+            motorStopAt = millis() + ms;
             req->send(200, "application/json", "{\"ok\":true}");
 
         } else if (cmd == "stop") {
-            calibStopAt = 0;
-            ledcWrite(SERVO_CH, 0);
+            motorStopAt = 0;
+            motorStop();
             req->send(200, "application/json", "{\"ok\":true}");
 
         } else if (cmd == "save") {
-            String dir = req->hasParam("dir") ? req->getParam("dir")->value() : "A";
-            int ms = req->hasParam("ms") ? constrain(req->getParam("ms")->value().toInt(), 50, 3000) : SERVO_MOVE_MS;
-            servoMoveMs     = ms;
-            bool swapped    = (dir == "B");
-            servoUnlockDuty = swapped ? SERVO_CR_LOCK   : SERVO_CR_UNLOCK;
-            servoLockDuty   = swapped ? SERVO_CR_UNLOCK : SERVO_CR_LOCK;
-            prefs.putInt ("s_ms",  ms);
-            prefs.putBool("s_dir", swapped);
+            String dir  = req->hasParam("dir") ? req->getParam("dir")->value() : "A";
+            int    ms   = req->hasParam("ms")  ? constrain(req->getParam("ms")->value().toInt(), 50, 3000) : MOTOR_MOVE_MS;
+            motorMoveMs     = ms;
+            motorDirSwapped = (dir == "B");
+            prefs.putInt ("m_ms",  ms);
+            prefs.putBool("m_dir", motorDirSwapped);
             Serial.printf("[CALIB] saved: dir=%s ms=%d\n", dir.c_str(), ms);
             req->send(200, "application/json", "{\"ok\":true}");
 
@@ -1054,24 +1204,19 @@ void setupServerRoutes() {
         const char* st = currentState == LOCK_OPEN     ? "LOCK_OPEN"
                        : currentState == READER_ACTIVE ? "READER_ACTIVE" : "IDLE";
         String json = "{\"state\":\""; json += st; json += "\"";
-
         json += ",\"uptime\":"; json += millis() / 1000;
 
-        // DHT
         json += ",\"dht\":{\"temp\":";
         json += isnan(cachedTemp) ? "null" : String(cachedTemp, 1);
-        json += ",\"hum\":";
-        json += isnan(cachedHum) ? "null" : String(cachedHum, 1);
+        json += ",\"hum\":null";
         json += ",\"age_ms\":"; json += (millis() - lastDHTRead);
         json += "}";
 
-        // Battery — live reading
         json += ",\"bat_live\":{\"raw\":"; json += bat.raw;
         json += ",\"v\":";   json += String(bat.vbat, 3);
         json += ",\"pct\":"; json += bat.pct;
         json += "}";
 
-        // Battery — sample window
         json += ",\"bat_samples\":[";
         for (int i = 0; i < BAT_SAMPLES; i++) {
             if (i > 0) json += ",";
@@ -1085,7 +1230,6 @@ void setupServerRoutes() {
             json += ",\"bat_avg_pct\":"; json += batPctAvg;
         }
 
-        // Cards
         json += ",\"cards\":[";
         String list = prefs.isKey("cardlist") ? prefs.getString("cardlist", "") : "";
         if (list.length() > 0) {
@@ -1100,37 +1244,25 @@ void setupServerRoutes() {
         }
         json += "]";
 
-        // RFID
         json += ",\"rfid\":{\"scanning\":";
         json += (currentState == READER_ACTIVE ? "true" : "false");
         json += ",\"bits\":"; json += rfid.bits;
         json += ",\"code\":"; json += rfid.code;
         json += "}";
-
         json += "}";
         req->send(200, "application/json", json);
     });
-
 }
 
 // =====================================================================
 // Setup
 // =====================================================================
 void setup() {
-    // מדידת פולס פרזיט ב-GPIO25 — חייב להיות לפני כל delay
-    if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0) {
-        pinMode(LOCK_SSR, INPUT_PULLDOWN);
-        wakeGlitchUs = (uint32_t)pulseIn(LOCK_SSR, HIGH, 10000UL);
-    } else {
-        wakeGlitchUs = 0;
-    }
-
     Serial.begin(115200);
     delay(300);
     bootCount++;
-    Serial.printf("[SYS] Boot #%u\n", bootCount);
+    Serial.printf("[SYS] Boot #%u  (ESP32-S3-WROOM-1 N16R8)\n", bootCount);
 
-    // זיהוי סיבת wake
     esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
     if      (cause == ESP_SLEEP_WAKEUP_EXT0)  wakeReason = WAKE_TOUCH;
     else if (cause == ESP_SLEEP_WAKEUP_TIMER) wakeReason = WAKE_TIMER;
@@ -1140,116 +1272,129 @@ void setup() {
         wakeReason == WAKE_TOUCH ? "TOUCH" :
         wakeReason == WAKE_TIMER ? "TIMER" : "BOOT");
 
-    // ── Timer Wake: קרא חיישנים, דווח, חזור לשינה מיד ──────────────
+    // ── Timer Wake: read sensors, report, go back to sleep ───────────
     if (wakeReason == WAKE_TIMER) {
         ds18.begin();
         ds18.requestTemperatures();
-        delay(750);  // 12-bit conversion — blocking OK here, going back to sleep after
+        delay(750);
         float t = ds18.getTempCByIndex(0);
         if (t < -100.0f) t = NAN;
-        int   bat = getBatteryPct();
+        int bat = getBatteryPct();
         Serial.printf("[TIMER] T=%.1f BAT=%d\n", isnan(t) ? -99.0f : t, bat);
 
-        // נסה WiFi + MQTT
         WiFi.mode(WIFI_STA);
-        wifiMulti.addAP(ssid,  password);
+        wifiMulti.addAP(ssid, password);
         unsigned long wStart = millis();
         while (wifiMulti.run() != WL_CONNECTED && millis() - wStart < WIFI_CONNECT_TIMEOUT_MS)
             delay(200);
 
         if (WiFi.status() == WL_CONNECTED) {
             Serial.printf("[WiFi] Connected: %s\n", WiFi.localIP().toString().c_str());
+            configTime(2 * 3600, 3600, "pool.ntp.org", "time.cloudflare.com");
+            time_t now = 0;
+            for (int i = 0; i < 25 && now < 1000000UL; i++) { delay(200); time(&now); }
+            if (now > 1000000UL) {
+                ntpEpoch  = (uint32_t)now;
+                ntpMillis = millis();
+                Serial.printf("[NTP] Synced: %lu\n", (unsigned long)now);
+            }
+            graphAddPoint(t, bat);
             if (connectMQTT()) {
                 mqttPublishDiscovery();
-                mqttFlushBuffer();                       // שולח רשומות שצבורות מהפעמים הקודמות
-                mqttPublishState(t, NAN, bat, true);    // שולח את הנוכחי ישירות
+                mqttFlushBuffer();
+                mqttPublishState(t, NAN, bat, true);
                 for (int i = 0; i < 20; i++) { mqttClient.loop(); delay(100); }
-                mqttClient.loop();
-                delay(200);
                 mqttClient.disconnect();
             } else {
-                rtcAddRecord(t, NAN, (uint8_t)bat, 0, 0);  // MQTT נכשל — שמור לפעם הבאה
-                Serial.println("[MQTT] Failed — data buffered");
+                rtcAddRecord(t, NAN, (uint8_t)bat, 0, 0);
             }
             WiFi.disconnect(true);
             WiFi.mode(WIFI_OFF);
         } else {
-            rtcAddRecord(t, NAN, (uint8_t)bat, 0, 0);  // אין WiFi — שמור לפעם הבאה
-            Serial.println("[WiFi] Timeout — data buffered for next wake");
+            if (ntpEpoch > 0) ntpEpoch += (uint32_t)(REPORT_INTERVAL_US / 1000000ULL);
+            graphAddPoint(t, bat);
+            rtcAddRecord(t, NAN, (uint8_t)bat, 0, 0);
+            Serial.println("[WiFi] Timeout — data buffered");
         }
 
         Serial.println("[SYS] Timer wake done — returning to deep sleep");
-        // GPIO25 servo hold
-        rtc_gpio_init(GPIO_NUM_25);
-        rtc_gpio_set_direction(GPIO_NUM_25, RTC_GPIO_MODE_OUTPUT_ONLY);
-        rtc_gpio_set_level(GPIO_NUM_25, 0);
-        rtc_gpio_hold_en(GPIO_NUM_25);
-        esp_sleep_enable_ext0_wakeup(GPIO_NUM_32, 1);
+        rtc_gpio_init(MOTOR_PWMA_GPIO);
+        rtc_gpio_set_direction(MOTOR_PWMA_GPIO, RTC_GPIO_MODE_OUTPUT_ONLY);
+        rtc_gpio_set_level(MOTOR_PWMA_GPIO, 0);
+        rtc_gpio_hold_en(MOTOR_PWMA_GPIO);
+        esp_sleep_enable_ext0_wakeup(TOUCH_GPIO, 1);
         esp_sleep_enable_timer_wakeup(REPORT_INTERVAL_US);
         esp_deep_sleep_start();
     }
 
-    // ── Touch Wake / Boot: פעולה רגילה ──────────────────────────────
-    pinMode(TOUCH_PIN, INPUT_PULLDOWN);
+    // ── Touch Wake / Boot: normal operation ─────────────────────────
+    pinMode(TOUCH_PIN,        INPUT_PULLDOWN);
     pinMode(BOOST_12V_EN_PIN, OUTPUT);
-    pinMode(D0_PIN, INPUT_PULLUP);
-    pinMode(D1_PIN, INPUT_PULLUP);
+    pinMode(D0_PIN,           INPUT_PULLUP);
+    pinMode(D1_PIN,           INPUT_PULLUP);
     digitalWrite(BOOST_12V_EN_PIN, LOW);
 
-    attachInterrupt(digitalPinToInterrupt(D0_PIN), rfid_isr, FALLING);
-    attachInterrupt(digitalPinToInterrupt(D1_PIN), rfid_isr, FALLING);
+    // Motor pins
+    pinMode(MOTOR_PWMA, OUTPUT);
+    pinMode(MOTOR_AIN1, OUTPUT);
+    pinMode(MOTOR_AIN2, OUTPUT);
+    pinMode(MOTOR_STBY, OUTPUT);
+    motorStandby();
+
+    attachInterrupt(digitalPinToInterrupt(D0_PIN), rfid_isr_d0, FALLING);
+    attachInterrupt(digitalPinToInterrupt(D1_PIN), rfid_isr_d1, FALLING);
 
     prefs.begin("safe-app", false);
+    motorMoveMs     = prefs.getInt ("m_ms",  MOTOR_MOVE_MS);
+    motorDirSwapped = prefs.getBool("m_dir", false);
+    Serial.printf("[MOTOR] moveMs=%d  dirSwapped=%d\n", motorMoveMs, motorDirSwapped);
 
-    // טעינת כיול סרוו שנשמר
-    servoMoveMs     = prefs.getInt("s_ms", SERVO_MOVE_MS);
-    bool dirSwapped = prefs.getBool("s_dir", false);
-    servoUnlockDuty = dirSwapped ? SERVO_CR_LOCK   : SERVO_CR_UNLOCK;
-    servoLockDuty   = dirSwapped ? SERVO_CR_UNLOCK : SERVO_CR_LOCK;
+    // Release RTC hold on MOTOR_PWMA after touch wake
+    if (wakeReason == WAKE_TOUCH) {
+        rtc_gpio_hold_dis(MOTOR_PWMA_GPIO);
+        rtc_gpio_deinit(MOTOR_PWMA_GPIO);
+    }
 
     ds18.begin();
     ds18.setResolution(12);
     ds18.setWaitForConversion(false);
     ds18.requestTemperatures();
-    delay(800);  // 12-bit conversion time
+    delay(800);
     {
         float _t = ds18.getTempCByIndex(0);
         if (_t > -100.0f) {
             cachedTemp = _t;
             Serial.printf("[DS18B20] Init: %.2f°C on GPIO%d\n", _t, DHTPIN);
         } else {
-            Serial.printf("[DS18B20] Init FAILED — check GPIO%d wiring & 4.7kΩ pull-up to 3.3V\n", DHTPIN);
+            Serial.printf("[DS18B20] Init FAILED — check GPIO%d + 4.7kΩ to 3.3V\n", DHTPIN);
         }
     }
     lastDHTRead = millis();
 
-    // שחרור hold של GPIO25 — רק אם עלינו משינה עמוקה (לא בבוט ראשון)
-    if (wakeReason == WAKE_TOUCH) {
-        rtc_gpio_hold_dis(GPIO_NUM_25);
-        rtc_gpio_deinit(GPIO_NUM_25);
-    }
-
-    // אתחול סרוו SG90 — GPIO25, 50Hz PWM
-    ledcSetup(SERVO_CH, SERVO_FREQ_HZ, SERVO_RES_BITS);
-    ledcAttachPin(LOCK_SSR, SERVO_CH);
-    ledcWrite(SERVO_CH, 0);  // מפסיק אות — הנעל מחזיקה עצמה, המנוע ישקוט  // עצירה בלבד באתחול — setSystemState(IDLE) ינעל אחר כך
-
     WiFi.mode(WIFI_STA);
-    wifiMulti.addAP(ssid,  password);
-    for (int i = 0; i < 4 && wifiMulti.run() != WL_CONNECTED; i++) delay(500);  // 2s max — WiFi הוא nice-to-have
+    wifiMulti.addAP(ssid, password);
+    for (int i = 0; i < 4 && wifiMulti.run() != WL_CONNECTED; i++) delay(500);
 
     if (WiFi.status() == WL_CONNECTED) {
         MDNS.begin("smartsafe");
-        Serial.println("=============================");
-        Serial.print  ("[WiFi] Connected! IP: ");
-        Serial.println(WiFi.localIP());
+        Serial.printf("[WiFi] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
         Serial.println("[WiFi] URL: http://smartsafe.local");
-        Serial.println("=============================");
 
+        configTime(2 * 3600, 3600, "pool.ntp.org", "time.cloudflare.com");
+        time_t now = 0;
+        for (int i = 0; i < 25 && now < 1000000UL; i++) { delay(200); time(&now); }
+        if (now > 1000000UL) {
+            ntpEpoch  = (uint32_t)now;
+            ntpMillis = millis();
+            Serial.printf("[NTP] Synced: %lu\n", (unsigned long)now);
+        } else {
+            Serial.println("[NTP] Sync failed");
+        }
 
         if (connectMQTT()) {
             mqttPublishDiscovery();
             mqttFlushBuffer();
+            mqttPublishState(cachedTemp, cachedHum, getBatteryPct(), true);
         }
     } else {
         Serial.println("[WiFi] Connection FAILED");
@@ -1262,57 +1407,40 @@ void setup() {
     activityTimer = millis();
 
     if (wakeReason == WAKE_TOUCH) {
-        Serial.printf("[WAKE] GPIO25 glitch measured: %u µs\n", wakeGlitchUs);
-        if (wakeGlitchUs > 0) {
-            ledcWrite(SERVO_CH, servoUnlockDuty);
-            delayMicroseconds(wakeGlitchUs);
-            ledcWrite(SERVO_CH, 0);
-            Serial.printf("[COMP] Applied %u µs compensation pulse (unlock dir)\n", wakeGlitchUs);
-        } else {
-            Serial.println("[WAKE] No glitch detected in setup() — may be bootloader-phase");
-        }
-        // כפה READER_ACTIVE — הכפתור כבר לא HIGH כשloop() מתחיל (setup לוקח 10+ שניות)
-        // ללא זה, הגלאי קצה מחמיץ את הלחיצה ו-activityTimer אף פעם לא מתרענן מלחיצת ה-wake
-        addLog("התעוררות ממגע — מפעיל קורא");
+        addLog("Touch wake — reader activated");
         Serial.println("[SYS] Wake from touch — activating reader");
-        setSystemState(READER_ACTIVE);
-        activityTimer = millis();
     } else {
-        addLog("מערכת הופעלה — קורא פעיל");
+        addLog("System started — reader active");
         Serial.println("[SYS] Boot — activating reader");
-        setSystemState(READER_ACTIVE);
-        activityTimer = millis();
     }
+    setSystemState(READER_ACTIVE);
+    activityTimer = millis();
 }
 
 // =====================================================================
 // Loop
 // =====================================================================
 void loop() {
-    // עצירת סרוו כיול (non-blocking — במקום delay בתוך ה-HTTP handler)
-    if (calibStopAt > 0 && millis() >= calibStopAt) {
-        ledcWrite(SERVO_CH, 0);
-        calibStopAt = 0;
+    // Non-blocking motor stop (used by calib, lock, unlock)
+    if (motorStopAt > 0 && millis() >= motorStopAt) {
+        motorStop();
+        motorStopAt = 0;
     }
 
     // MQTT keepalive
     if (mqttClient.connected()) mqttClient.loop();
 
-    // WiFi + MQTT reconnect — nice-to-have, נבדק כל 60s כשלא סורקים כרטיס
-    // (כשחוזרים הביתה הרשת עולה ומרוקנת את ה-buffer אוטומטית)
+    // WiFi + MQTT reconnect every 60s when idle
     static unsigned long lastNetCheck = 0;
     if (currentState != READER_ACTIVE && millis() - lastNetCheck >= 60000) {
         lastNetCheck = millis();
         if (WiFi.status() != WL_CONNECTED) wifiMulti.run(2000);
         if (WiFi.status() == WL_CONNECTED && !mqttClient.connected()) {
-            if (connectMQTT()) {
-                mqttPublishDiscovery();
-                mqttFlushBuffer();
-            }
+            if (connectMQTT()) { mqttPublishDiscovery(); mqttFlushBuffer(); }
         }
     }
 
-    // DS18B20 — בקשת המרה כל 5 שניות, קריאת תוצאה אחרי 750ms (non-blocking)
+    // DS18B20 — request every 5s, read result after 750ms (non-blocking)
     static bool ds18Pending = false;
     static unsigned long ds18ReqAt = 0;
     if (!ds18Pending && millis() - lastDHTRead >= 5000) {
@@ -1328,12 +1456,11 @@ void loop() {
             cachedTemp = t;
             Serial.printf("[DS18B20] %.2f°C\n", t);
         } else {
-            Serial.println("[DS18B20] Read FAILED — check wiring");
+            Serial.println("[DS18B20] Read FAILED");
         }
     }
 
-    // דגימת סוללה כל 10 שניות; מיצוע עם סינון outliers אחרי 6 דגימות (דקה)
-    // מושעה בזמן READER_ACTIVE — analogRead מייצר רעש ADC שעלול להפריע ל-Wiegand ISR
+    // Battery sampling every 10s; filtered average after 6 samples
     if (currentState != READER_ACTIVE && millis() - lastBatSampleMs >= BAT_SAMPLE_MS) {
         lastBatSampleMs = millis();
         batSamples[batSampleIdx++] = getBatteryInfo().vbat;
@@ -1345,24 +1472,25 @@ void loop() {
         }
     }
 
-    // MQTT ל-HA כל 10 דקות (רק אם יש מיצוע תקין)
+    // MQTT periodic (every 10 min, only when averaged data is ready)
     if (batPctAvg >= 0 && mqttClient.connected() &&
         millis() - lastMqttMs >= MQTT_PERIODIC_MS) {
         lastMqttMs = millis();
         mqttPublishState(cachedTemp, cachedHum, batPctAvg, currentState != LOCK_OPEN);
+        graphAddPoint(cachedTemp, batPctAvg);
     }
 
-    // Touch
+    // Touch button
     static bool lastTouch = LOW;
     bool touch = digitalRead(TOUCH_PIN);
     if (touch == HIGH && lastTouch == LOW) {
         activityTimer = millis();
-        if (currentState == IDLE)          setSystemState(READER_ACTIVE);
+        if (currentState == IDLE)               setSystemState(READER_ACTIVE);
         else if (currentState == READER_ACTIVE) stateTimer = millis();
     }
     lastTouch = touch;
 
-    // RFID
+    // RFID Wiegand processing
     if (currentState == READER_ACTIVE) {
         if (millis() - boosterStartTime < BOOSTER_SETTLING_MS) {
             noInterrupts(); v_rfid.bits = 0; v_rfid.code = 0; interrupts();
@@ -1378,26 +1506,22 @@ void loop() {
                 if (finalCode == masterKey) {
                     editMode = !editMode;
                     stateTimer = millis(); activityTimer = millis();
-                    addLog(editMode ? "מצב עריכה הופעל" : "מצב עריכה כובה");
-                    Serial.printf("[MODE] Edit: %s\n", editMode ? "ON" : "OFF");
+                    addLog(editMode ? "Edit mode ON" : "Edit mode OFF");
                 } else if (editMode) {
                     if (!cardExists(finalCode)) {
                         cardAdd(finalCode);
-                        char buf[48]; snprintf(buf, sizeof(buf), "כרטיס #%u נרשם", finalCode);
+                        char buf[48]; snprintf(buf, sizeof(buf), "Card #%u registered", finalCode);
                         addLog(buf);
-                        Serial.println("[EDIT] Card Registered");
                     } else {
                         cardRemove(finalCode);
-                        char buf[48]; snprintf(buf, sizeof(buf), "כרטיס #%u נמחק", finalCode);
+                        char buf[48]; snprintf(buf, sizeof(buf), "Card #%u removed", finalCode);
                         addLog(buf);
-                        Serial.println("[EDIT] Card Deleted");
                     }
                     stateTimer = millis(); activityTimer = millis();
                 } else {
                     if (cardExists(finalCode)) {
-                        cardAdd(finalCode);
                         setSystemState(LOCK_OPEN);
-                        char buf[48]; snprintf(buf, sizeof(buf), "נפתח: כרטיס #%u", finalCode);
+                        char buf[48]; snprintf(buf, sizeof(buf), "Opened: card #%u", finalCode);
                         addLog(buf);
                         activityTimer = millis();
                         rtcAddRecord(cachedTemp, cachedHum, getBatteryPct(), 2, 1, finalCode);
@@ -1406,11 +1530,13 @@ void loop() {
                             mqttPublishState(cachedTemp, cachedHum, getBatteryPct(), false);
                         }
                     } else {
-                        char buf[52]; snprintf(buf, sizeof(buf), "נדחה: כרטיס #%u לא מורשה", finalCode);
+                        char buf[52]; snprintf(buf, sizeof(buf), "Denied: card #%u", finalCode);
                         addLog(buf);
-                        Serial.println("[RFID] Denied");
                         rtcAddRecord(cachedTemp, cachedHum, getBatteryPct(), 0, 3, finalCode);
-                        if (mqttClient.connected()) mqttPublishEvent("denied", finalCode);
+                        if (mqttClient.connected()) {
+                            mqttPublishEvent("denied", finalCode);
+                            mqttPublishState(cachedTemp, cachedHum, getBatteryPct(), true);
+                        }
                     }
                 }
             } else {
@@ -1418,31 +1544,32 @@ void loop() {
             }
         }
         if (millis() - stateTimer > READER_TIMEOUT_MS) {
-            addLog("קורא כובה (timeout)");
+            addLog("Reader timeout");
             setSystemState(IDLE);
         }
     }
 
-    // Lock timer
-    if (currentState == LOCK_OPEN && (millis() - stateTimer > LOCK_OPEN_MS)) {
-        addLog("דלת ננעלה");
+    // Auto-lock after LOCK_OPEN_MS
+    if (currentState == LOCK_OPEN && millis() - stateTimer > LOCK_OPEN_MS) {
+        addLog("Door locked");
         setSystemState(IDLE);
         if (mqttClient.connected())
             mqttPublishState(cachedTemp, cachedHum, getBatteryPct(), true);
     }
 
-    // כניסה לשינה עמוקה אחרי 5 דקות ב-IDLE
+    // Idle timeout → deep sleep
     if (currentState == IDLE && millis() - activityTimer > SLEEP_TIMEOUT_MS) {
-        addLog("כניסה לשינה (5 דק' ב-IDLE)");
-        Serial.printf("[SYS] No activity for %lus — entering deep sleep\n", (millis() - activityTimer) / 1000);
+        addLog("Idle timeout — going to sleep");
+        Serial.printf("[SYS] No activity for %lus — entering deep sleep\n",
+                      (millis() - activityTimer) / 1000);
         WiFi.disconnect(true);
         WiFi.mode(WIFI_OFF);
-        // GPIO25 servo hold
-        rtc_gpio_init(GPIO_NUM_25);
-        rtc_gpio_set_direction(GPIO_NUM_25, RTC_GPIO_MODE_OUTPUT_ONLY);
-        rtc_gpio_set_level(GPIO_NUM_25, 0);
-        rtc_gpio_hold_en(GPIO_NUM_25);
-        esp_sleep_enable_ext0_wakeup(GPIO_NUM_32, 1);
+        motorStandby();
+        rtc_gpio_init(MOTOR_PWMA_GPIO);
+        rtc_gpio_set_direction(MOTOR_PWMA_GPIO, RTC_GPIO_MODE_OUTPUT_ONLY);
+        rtc_gpio_set_level(MOTOR_PWMA_GPIO, 0);
+        rtc_gpio_hold_en(MOTOR_PWMA_GPIO);
+        esp_sleep_enable_ext0_wakeup(TOUCH_GPIO, 1);
         esp_sleep_enable_timer_wakeup(REPORT_INTERVAL_US);
         esp_deep_sleep_start();
     }
