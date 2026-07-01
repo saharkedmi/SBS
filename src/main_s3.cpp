@@ -159,6 +159,58 @@ int graphGetIdx(int pos) {
     return (graphHead + pos) % GRAPH_BUF_SIZE;
 }
 
+Preferences       prefs;
+
+// =====================================================================
+// Persistent Log — NVS-backed, survives power-off (144 × 8 B = 1152 B)
+// evt: 0=sensor, 1=unlock, 2=lock, 3=denied, 4=boot
+// =====================================================================
+#define PLOG_MAX 144
+
+struct __attribute__((packed)) PLogRecord {
+    uint32_t ts;
+    int16_t  temp10;
+    uint8_t  bat;
+    uint8_t  evt;
+};
+
+PLogRecord plogBuf[PLOG_MAX];
+int plogHead  = 0;
+int plogCount = 0;
+
+void plogLoad() {
+    if (prefs.getBytesLength("pl_d") == sizeof(plogBuf)) {
+        prefs.getBytes("pl_d", plogBuf, sizeof(plogBuf));
+        plogHead  = prefs.getInt("pl_h", 0);
+        plogCount = prefs.getInt("pl_n", 0);
+        if (plogHead < 0 || plogHead >= PLOG_MAX) plogHead = 0;
+        if (plogCount < 0 || plogCount > PLOG_MAX) plogCount = 0;
+    }
+}
+
+void plogSave() {
+    prefs.putBytes("pl_d", plogBuf, sizeof(plogBuf));
+    prefs.putInt("pl_h", plogHead);
+    prefs.putInt("pl_n", plogCount);
+}
+
+void plogAdd(float temp, uint8_t bat, uint8_t evt) {
+    PLogRecord r;
+    r.ts     = getEpoch();
+    r.temp10 = isnan(temp) ? (int16_t)-9990 : (int16_t)(temp * 10.0f);
+    r.bat    = bat;
+    r.evt    = evt;
+    plogBuf[plogHead] = r;
+    plogHead = (plogHead + 1) % PLOG_MAX;
+    if (plogCount < PLOG_MAX) plogCount++;
+    plogSave();
+}
+
+int plogGetIdx(int pos) {
+    if (plogCount < PLOG_MAX) return pos;
+    return (plogHead + pos) % PLOG_MAX;
+}
+
 // =====================================================================
 // State Machine
 // =====================================================================
@@ -185,7 +237,6 @@ uint32_t masterKey = 10311717;
 OneWire           oneWire(DHTPIN);
 DallasTemperature ds18(&oneWire);
 AsyncWebServer    server(80);
-Preferences       prefs;
 WiFiClient        wifiClient;
 WiFiMulti         wifiMulti;
 PubSubClient      mqttClient(wifiClient);
@@ -200,6 +251,7 @@ float         batVAvg         = NAN;
 int           batPctAvg       = -1;
 unsigned long lastBatSampleMs = 0;
 unsigned long lastMqttMs      = 0;
+unsigned long lastPlogMs      = 0;
 
 // Motor runtime config — loaded from Preferences, tunable via /calib
 int           motorMoveMs     = MOTOR_MOVE_MS;
@@ -667,8 +719,13 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(
 svg{width:100%;display:block;overflow:visible}
 .empty{padding:32px;text-align:center;color:var(--tm);font-size:.82rem}
 .stats{display:flex;gap:20px;margin-top:8px;flex-wrap:wrap}
-.stat{font-size:.72rem;color:var(--tm)}
-.stat b{color:var(--tx);font-weight:600;margin-left:3px}
+.stat{font-size:.72rem;color:var(--tm)}.stat b{color:var(--tx);font-weight:600;margin-left:3px}
+.legend{display:flex;gap:12px;flex-wrap:wrap;margin-top:10px}
+.leg{font-size:.65rem;display:flex;align-items:center;gap:4px;color:var(--tm)}
+.leg-dot{width:8px;height:8px;border-radius:50%;display:inline-block}
+.ev-row{display:flex;gap:10px;align-items:center;padding:5px 0;border-bottom:1px solid var(--bd);font-size:.75rem}
+.ev-row:last-child{border-bottom:none}
+.ev-time{color:var(--tm);min-width:80px;font-size:.68rem}
 </style>
 </head>
 <body>
@@ -685,56 +742,90 @@ svg{width:100%;display:block;overflow:visible}
   <div class="chart-lbl">Battery (%)</div>
   <div id="bChart"><div class="empty">Loading...</div></div>
   <div class="stats" id="bStats"></div>
+  <div class="legend">
+    <div class="leg"><span class="leg-dot" style="background:#10b981"></span>Unlock</div>
+    <div class="leg"><span class="leg-dot" style="background:#f87171"></span>Lock</div>
+    <div class="leg"><span class="leg-dot" style="background:#fb923c"></span>Denied</div>
+    <div class="leg"><span class="leg-dot" style="background:#818cf8"></span>Boot</div>
+  </div>
+</div>
+<div class="card">
+  <div class="chart-lbl">Recent Events</div>
+  <div id="evList"><div class="empty">Loading...</div></div>
 </div>
 <script>
-const PL=34,PR=8,PT=8,PB=22,IH=100,W=460,IW=W-PL-PR;
-function chart(pts,yLo,yHi,stroke,unit){
+const PL=34,PR=8,PT=12,PB=22,IH=96,W=460,IW=W-PL-PR;
+const EV_COL={1:'#10b981',2:'#f87171',3:'#fb923c',4:'#818cf8'};
+const EV_LBL={1:'Unlocked',2:'Locked',3:'Denied',4:'Boot'};
+function chart(pts,evs,yLo,yHi,stroke,unit){
   if(!pts||pts.length<2)return'<div class="empty">Not enough data</div>';
   const n=pts.length;
-  const xS=i=>(PL+i/(n-1)*IW).toFixed(1);
+  const t0=pts[0].ts,t1=pts[n-1].ts,tSpan=t1-t0||1;
+  const xByTs=ts=>(PL+(ts-t0)/tSpan*IW).toFixed(1);
+  const xS=i=>xByTs(pts[i].ts);
   const yS=v=>(PT+IH-(v-yLo)/(yHi-yLo||1)*IH).toFixed(1);
   const steps=4;let g='';
   for(let i=0;i<=steps;i++){
     const v=yLo+(yHi-yLo)/steps*i,y=(PT+IH-(v-yLo)/(yHi-yLo||1)*IH).toFixed(1);
     g+=`<line x1="${PL}" y1="${y}" x2="${W-PR}" y2="${y}" stroke="#2a2a45" stroke-width="1"/>`;
-    g+=`<text x="${PL-4}" y="${(parseFloat(y)+3.5).toFixed(1)}" text-anchor="end" font-size="9" fill="#64748b">${unit==='%'?v.toFixed(0):v.toFixed(1)}</text>`;
+    g+=`<text x="${PL-4}" y="${(+y+3.5).toFixed(1)}" text-anchor="end" font-size="9" fill="#64748b">${unit==='%'?v.toFixed(0):v.toFixed(1)}</text>`;
   }
   const tStep=Math.max(1,Math.floor(n/5));
   for(let i=0;i<n;i+=tStep){
-    const p=pts[i],x=xS(i);
-    const lbl=p.ts>86400?(()=>{const d=new Date(p.ts*1000);return d.getHours().toString().padStart(2,'0')+':'+d.getMinutes().toString().padStart(2,'0');})():(Math.floor(p.ts/3600)+'h');
+    const x=xS(i),p=pts[i];
+    const lbl=p.ts>86400?(d=>d.getHours().toString().padStart(2,'0')+':'+d.getMinutes().toString().padStart(2,'0'))(new Date(p.ts*1000)):(Math.floor(p.ts/3600)+'h');
     g+=`<text x="${x}" y="${PT+IH+14}" text-anchor="middle" font-size="9" fill="#64748b">${lbl}</text>`;
   }
   let area=`M${xS(0)},${yS(pts[0].v)}`,line=`M${xS(0)},${yS(pts[0].v)}`;
   for(let i=1;i<n;i++){area+=` L${xS(i)},${yS(pts[i].v)}`;line+=` L${xS(i)},${yS(pts[i].v)}`;}
   area+=` L${xS(n-1)},${(PT+IH).toFixed(1)} L${xS(0)},${(PT+IH).toFixed(1)} Z`;
   const lx=xS(n-1),ly=yS(pts[n-1].v);
-  return`<svg viewBox="0 0 ${W} ${PT+IH+PB}" xmlns="http://www.w3.org/2000/svg">${g}<path d="${area}" fill="${stroke}" fill-opacity=".07"/><path d="${line}" fill="none" stroke="${stroke}" stroke-width="1.5" stroke-linejoin="round"/><circle cx="${lx}" cy="${ly}" r="3" fill="${stroke}"/></svg>`;
+  let marks='';
+  for(const ev of evs){
+    if(!EV_COL[ev.evt])continue;
+    const r=(ev.ts-t0)/tSpan;
+    if(r<0||r>1)continue;
+    const ex=(PL+r*IW).toFixed(1),c=EV_COL[ev.evt];
+    marks+=`<line x1="${ex}" y1="${PT}" x2="${ex}" y2="${PT+IH}" stroke="${c}" stroke-width="1" stroke-dasharray="3,3" opacity="0.5"/>`;
+    marks+=`<circle cx="${ex}" cy="${PT}" r="4" fill="${c}" opacity="0.85"/>`;
+  }
+  return`<svg viewBox="0 0 ${W} ${PT+IH+PB}" xmlns="http://www.w3.org/2000/svg">${g}${marks}<path d="${area}" fill="${stroke}" fill-opacity=".07"/><path d="${line}" fill="none" stroke="${stroke}" stroke-width="1.5" stroke-linejoin="round"/><circle cx="${lx}" cy="${ly}" r="3" fill="${stroke}"/></svg>`;
+}
+function fmtTime(ts){
+  if(ts>86400){const d=new Date(ts*1000);return d.toLocaleDateString('en-GB',{month:'short',day:'numeric'})+' '+d.getHours().toString().padStart(2,'0')+':'+d.getMinutes().toString().padStart(2,'0');}
+  return Math.floor(ts/60)+'min';
 }
 async function load(){
   try{
     const d=await(await fetch('/api/graph')).json();
     if(!d||!d.length){
-      document.getElementById('tChart').innerHTML='<div class="empty">No data yet &#8212; recorded every 10 min</div>';
-      document.getElementById('bChart').innerHTML='<div class="empty">No data yet</div>';
-      document.getElementById('subEl').textContent='0 points';return;
+      ['tChart','bChart'].forEach(id=>document.getElementById(id).innerHTML='<div class="empty">No data yet &#8212; recorded every 10 min</div>');
+      document.getElementById('subEl').textContent='0 points';
+      document.getElementById('evList').innerHTML='<div class="empty">No events recorded</div>';
+      return;
     }
-    document.getElementById('subEl').textContent=d.length+' point'+(d.length===1?'':'s')+' · up to 24h';
+    const evs=d.filter(p=>p.evt>0);
+    document.getElementById('subEl').textContent=d.length+' point'+(d.length===1?'':'s')+' · up to 24h (NVS)';
     const tp=d.filter(p=>p.temp!==null).map(p=>({ts:p.ts,v:p.temp}));
     if(tp.length>=2){
       const vs=tp.map(p=>p.v),mn=Math.min(...vs),mx=Math.max(...vs),pad=Math.max(.5,(mx-mn)*.15);
-      document.getElementById('tChart').innerHTML=chart(tp,mn-pad,mx+pad,'#06b6d4','C');
+      document.getElementById('tChart').innerHTML=chart(tp,evs,mn-pad,mx+pad,'#06b6d4','C');
       const last=tp[tp.length-1];
       document.getElementById('tStats').innerHTML=`<div class="stat">Now<b>${last.v.toFixed(1)}&#176;C</b></div><div class="stat">Min<b>${mn.toFixed(1)}&#176;C</b></div><div class="stat">Max<b>${mx.toFixed(1)}&#176;C</b></div>`;
     }else document.getElementById('tChart').innerHTML='<div class="empty">Not enough data</div>';
     const bp=d.map(p=>({ts:p.ts,v:p.bat}));
     const bvs=bp.map(p=>p.v),bmn=Math.max(0,Math.min(...bvs)-5),bmx=Math.min(100,Math.max(...bvs)+5);
-    document.getElementById('bChart').innerHTML=chart(bp,bmn,bmx,'#10b981','%');
+    document.getElementById('bChart').innerHTML=chart(bp,evs,bmn,bmx,'#10b981','%');
     const blast=bp[bp.length-1];
     document.getElementById('bStats').innerHTML=`<div class="stat">Now<b>${blast.v}%</b></div><div class="stat">Min<b>${Math.min(...bvs)}%</b></div><div class="stat">Max<b>${Math.max(...bvs)}%</b></div>`;
+    const evDiv=document.getElementById('evList');
+    if(evs.length){
+      evDiv.innerHTML=[...evs].reverse().slice(0,30).map(ev=>`<div class="ev-row"><span class="ev-time">${fmtTime(ev.ts)}</span><span style="color:${EV_COL[ev.evt]||'var(--tx)'}">${EV_LBL[ev.evt]||'Event'}</span></div>`).join('');
+    }else{
+      evDiv.innerHTML='<div class="empty" style="padding:12px">No events in this window</div>';
+    }
   }catch(e){
-    document.getElementById('tChart').innerHTML='<div class="empty">Failed to load</div>';
-    document.getElementById('bChart').innerHTML='<div class="empty">Failed to load</div>';
+    ['tChart','bChart'].forEach(id=>document.getElementById(id).innerHTML='<div class="empty">Failed to load</div>');
   }
 }
 load();setInterval(load,60000);
@@ -1134,6 +1225,7 @@ void setSystemState(SystemState newState) {
         lockHoldStart = 0;
         digitalWrite(BOOST_12V_EN_PIN, LOW);
         if (prevState == LOCK_OPEN) {
+            plogAdd(cachedTemp, (uint8_t)constrain(batPctAvg >= 0 ? batPctAvg : getBatteryPct(), 0, 100), 2);
             motorLock();
             motorStopAt = millis() + motorMoveMs;
         }
@@ -1148,6 +1240,7 @@ void setSystemState(SystemState newState) {
         addLog("RFID reader activated");
         Serial.println("[FSM] READER_ACTIVE");
     } else if (newState == LOCK_OPEN) {
+        plogAdd(cachedTemp, (uint8_t)constrain(batPctAvg >= 0 ? batPctAvg : getBatteryPct(), 0, 100), 1);
         motorUnlock();
         motorStopAt = millis() + motorMoveMs;
         digitalWrite(BOOST_12V_EN_PIN, LOW);
@@ -1262,15 +1355,16 @@ void setupServerRoutes() {
     server.on("/api/graph", HTTP_GET, [](AsyncWebServerRequest *req) {
         if (!req->authenticate(www_username, www_password)) return req->requestAuthentication();
         String json = "[";
-        for (int i = 0; i < graphCount; i++) {
-            int idx = graphGetIdx(i);
-            GraphPoint& p = graphBuf[idx];
+        for (int i = 0; i < plogCount; i++) {
+            int idx = plogGetIdx(i);
+            PLogRecord& r = plogBuf[idx];
             if (i > 0) json += ",";
-            json += "{\"ts\":";   json += p.ts;
+            json += "{\"ts\":";    json += r.ts;
             json += ",\"temp\":";
-            if (p.temp10 == -9990) json += "null";
-            else json += String(p.temp10 / 10.0f, 1);
-            json += ",\"bat\":";  json += p.bat_pct;
+            if (r.temp10 == -9990) json += "null";
+            else json += String(r.temp10 / 10.0f, 1);
+            json += ",\"bat\":";   json += r.bat;
+            json += ",\"evt\":";   json += r.evt;
             json += "}";
         }
         json += "]";
@@ -1482,6 +1576,9 @@ void setup() {
     motorDirSwapped = prefs.getBool("m_dir", true);
     Serial.printf("[MOTOR] moveMs=%d  dirSwapped=%d\n", motorMoveMs, motorDirSwapped);
 
+    plogLoad();
+    plogAdd(NAN, (uint8_t)constrain(getBatteryPct(), 0, 100), 4); // boot event
+
     // Release RTC hold on MOTOR_PWMA after touch wake
     if (wakeReason == WAKE_TOUCH) {
         rtc_gpio_hold_dis(MOTOR_PWMA_GPIO);
@@ -1632,7 +1729,12 @@ void loop() {
         millis() - lastMqttMs >= MQTT_PERIODIC_MS) {
         lastMqttMs = millis();
         mqttPublishState(cachedTemp, cachedHum, batPctAvg, currentState != LOCK_OPEN);
-        graphAddPoint(cachedTemp, batPctAvg);
+    }
+
+    // Persistent log sensor (every 10 min, independent of MQTT)
+    if (batPctAvg >= 0 && millis() - lastPlogMs >= MQTT_PERIODIC_MS) {
+        lastPlogMs = millis();
+        plogAdd(cachedTemp, (uint8_t)batPctAvg, 0);
     }
 
     // Touch button
@@ -1692,6 +1794,7 @@ void loop() {
                         ledSetEffect(LED_RED_FADE, LED_RAINBOW, 500);
                         char buf[52]; snprintf(buf, sizeof(buf), "Denied: card #%u", finalCode);
                         addLog(buf);
+                        plogAdd(cachedTemp, (uint8_t)constrain(batPctAvg >= 0 ? batPctAvg : getBatteryPct(), 0, 100), 3);
                         rtcAddRecord(cachedTemp, cachedHum, getBatteryPct(), 0, 3, finalCode);
                         if (mqttClient.connected()) {
                             mqttPublishEvent("denied", finalCode);
