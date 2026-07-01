@@ -11,6 +11,7 @@
 #include <esp_wifi.h>
 #include <driver/rtc_io.h>
 #include <PubSubClient.h>
+#include <Adafruit_NeoPixel.h>
 
 // =====================================================================
 // Pin Map — ESP32-S3-WROOM-1 N16R8
@@ -29,6 +30,8 @@
 #define MOTOR_AIN1       18   // Direction 1
 #define MOTOR_AIN2       15   // Direction 2  (NOT 19 — USB D-)
 #define MOTOR_STBY       17   // STBY: LOW=1µA sleep, HIGH=active
+#define LED_PIN          6    // WS2812B data
+#define LED_COUNT        12
 
 // Compile-time GPIO enum constants required by RTC/sleep API
 #define MOTOR_PWMA_GPIO  GPIO_NUM_8
@@ -37,13 +40,13 @@
 // =====================================================================
 // Timing
 // =====================================================================
-#define LOCK_OPEN_MS        15000
+#define LOCK_HOLD_MS        10000  // hold time AFTER motor finishes opening
 #define LOCK_COOLDOWN_MS    2000
 #define READER_TIMEOUT_MS   15000
 #define WIEGAND_TIMEOUT_US  200000
 #define BOOSTER_SETTLING_MS 80
 
-#define MOTOR_MOVE_MS    1000   // default ms to complete lock/unlock stroke
+#define MOTOR_MOVE_MS    5000   // default ms to complete lock/unlock stroke
 #define MAX_PWM          150    // 60% duty — limits 5V supply to ~3V for N20
 
 #define SLEEP_TIMEOUT_MS        300000
@@ -200,8 +203,9 @@ unsigned long lastMqttMs      = 0;
 
 // Motor runtime config — loaded from Preferences, tunable via /calib
 int           motorMoveMs     = MOTOR_MOVE_MS;
-bool          motorDirSwapped = false;          // true → A=lock, B=unlock
+bool          motorDirSwapped = true;           // true → A=lock, B=unlock
 volatile unsigned long motorStopAt = 0;
+unsigned long          lockHoldStart = 0;   // set when motor finishes opening
 
 // =====================================================================
 // Activity Log
@@ -224,6 +228,18 @@ void addLog(const char* msg) {
 // Battery
 // =====================================================================
 struct BatteryInfo { int raw; float vbat; int pct; };
+
+static float takeBatReading() {
+    float v[3];
+    for (int i = 0; i < 3; i++) {
+        delayMicroseconds(500);
+        v[i] = (analogReadMilliVolts(BAT_ADC) / 1000.0f) * 2.0f;
+    }
+    if (v[0] > v[1]) { float t = v[0]; v[0] = v[1]; v[1] = t; }
+    if (v[1] > v[2]) { float t = v[1]; v[1] = v[2]; v[2] = t; }
+    if (v[0] > v[1]) { float t = v[0]; v[0] = v[1]; v[1] = t; }
+    return v[1];
+}
 
 BatteryInfo getBatteryInfo() {
     BatteryInfo b;
@@ -450,8 +466,14 @@ void motorStandby() {
     digitalWrite(MOTOR_STBY, LOW);
 }
 
-void motorUnlock() { motorDirSwapped ? motorReverse() : motorForward(); }
-void motorLock()   { motorDirSwapped ? motorForward() : motorReverse(); }
+void motorUnlock() {
+    Serial.printf("[MOTOR] Unlock — dir=%s ms=%d\n", motorDirSwapped?"B":"A", motorMoveMs);
+    motorDirSwapped ? motorReverse() : motorForward();
+}
+void motorLock() {
+    Serial.printf("[MOTOR] Lock — dir=%s ms=%d\n", motorDirSwapped?"A":"B", motorMoveMs);
+    motorDirSwapped ? motorForward() : motorReverse();
+}
 
 // =====================================================================
 // HTML — Dashboard
@@ -1000,23 +1022,129 @@ void IRAM_ATTR rfid_isr_d1() {
 }
 
 // =====================================================================
+// WS2812B LED Ring
+// =====================================================================
+Adafruit_NeoPixel ring(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+enum LedEffect { LED_OFF, LED_PAUSE, LED_RAINBOW, LED_BLUE_FADE,
+                 LED_GREEN_BLINK, LED_RED_BLINK,
+                 LED_GREEN_FADE,  LED_RED_FADE };
+
+LedEffect     ledEffect        = LED_OFF;
+LedEffect     ledReturnEffect  = LED_OFF;
+LedEffect     ledPendingEffect = LED_OFF;
+LedEffect     ledPendingReturn = LED_OFF;
+uint32_t      ledPauseDuration = 0;
+unsigned long ledEffectStart   = 0;
+uint16_t      rainbowHue       = 0;
+
+// pauseMs: blank delay before starting effect.
+// When leaving RAINBOW, at least 200ms is enforced to settle DIN.
+void ledSetEffect(LedEffect effect, LedEffect returnTo = LED_OFF, uint32_t pauseMs = 0) {
+    uint32_t pause = pauseMs;
+    if (ledEffect == LED_RAINBOW && effect != LED_OFF && effect != LED_RAINBOW)
+        pause = (pause > 200) ? pause : 200;
+    if (pause > 0) {
+        ledPendingEffect = effect;
+        ledPendingReturn = returnTo;
+        ledPauseDuration = pause;
+        ledEffect        = LED_PAUSE;
+        ledEffectStart   = millis();
+    } else {
+        ledEffect       = effect;
+        ledReturnEffect = returnTo;
+        ledEffectStart  = millis();
+    }
+}
+
+void ledUpdate() {
+    unsigned long t = millis() - ledEffectStart;
+
+    switch (ledEffect) {
+        case LED_OFF:
+            ring.clear(); ring.show(); break;
+
+        case LED_PAUSE:
+            ring.clear(); ring.show();
+            if (t >= ledPauseDuration) {
+                ledEffect       = ledPendingEffect;
+                ledReturnEffect = ledPendingReturn;
+                ledEffectStart  = millis();
+            }
+            break;
+
+        case LED_RAINBOW:
+            rainbowHue += 256;
+            for (int i = 0; i < LED_COUNT; i++) {
+                uint16_t hue = rainbowHue + (uint16_t)(i * 65536L / LED_COUNT);
+                ring.setPixelColor(i, ring.gamma32(ring.ColorHSV(hue, 255, 200)));
+            }
+            ring.show(); break;
+
+        case LED_BLUE_FADE: {
+            // 1-second cycle: 500ms up + 500ms down, continuous
+            const uint32_t period = 1000, half = 500;
+            uint8_t br = (t % period < half)
+                         ? (uint8_t)((t % period) * 255 / half)
+                         : (uint8_t)((period - t % period) * 255 / half);
+            uint32_t c = ring.Color(0, 0, br);
+            for (int i = 0; i < LED_COUNT; i++) ring.setPixelColor(i, c);
+            ring.show(); break;
+        }
+
+        case LED_GREEN_BLINK:
+        case LED_RED_BLINK: {
+            // 3 × 1s (500ms ON + 500ms OFF) = 3s total
+            const uint32_t cycle = 1000, on_ms = 500, reps = 3;
+            if (t >= cycle * reps) { ledSetEffect(ledReturnEffect); break; }
+            uint32_t tc = t % cycle;
+            uint32_t c  = (ledEffect == LED_GREEN_BLINK)
+                          ? ring.Color(0, 180, 0) : ring.Color(180, 0, 0);
+            if (tc < on_ms) { for (int i=0;i<LED_COUNT;i++) ring.setPixelColor(i,c); ring.show(); }
+            else            { ring.clear(); ring.show(); }
+            break;
+        }
+
+        case LED_GREEN_FADE:
+        case LED_RED_FADE: {
+            // 3 × 1s (500ms fade-in + 500ms fade-out) = 3s total
+            const uint32_t cycle = 1000, half = 500, reps = 3;
+            if (t >= cycle * reps) { ledSetEffect(ledReturnEffect); break; }
+            uint32_t tc = t % cycle;
+            uint8_t  br = (tc < half) ? (uint8_t)(tc * 255 / half)
+                                      : (uint8_t)((cycle - tc) * 255 / half);
+            uint32_t c = (ledEffect == LED_GREEN_FADE)
+                         ? ring.Color(0, br, 0) : ring.Color(br, 0, 0);
+            for (int i = 0; i < LED_COUNT; i++) ring.setPixelColor(i, c);
+            ring.show(); break;
+        }
+    }
+}
+
+// =====================================================================
 // FSM
 // =====================================================================
 void setSystemState(SystemState newState) {
+    SystemState prevState = currentState;
     currentState  = newState;
     stateTimer    = millis();
     activityTimer = millis();
 
     if (newState == IDLE) {
+        lockHoldStart = 0;
         digitalWrite(BOOST_12V_EN_PIN, LOW);
-        motorLock();
-        motorStopAt = millis() + motorMoveMs;
+        if (prevState == LOCK_OPEN) {
+            motorLock();
+            motorStopAt = millis() + motorMoveMs;
+        }
         editMode = false;
+        ledSetEffect(LED_OFF);
         Serial.println("[FSM] IDLE — locking");
     } else if (newState == READER_ACTIVE) {
         digitalWrite(BOOST_12V_EN_PIN, HIGH);
         boosterStartTime = millis();
         noInterrupts(); v_rfid.bits = 0; v_rfid.code = 0; interrupts();
+        ledSetEffect(LED_RAINBOW);
         addLog("RFID reader activated");
         Serial.println("[FSM] READER_ACTIVE");
     } else if (newState == LOCK_OPEN) {
@@ -1182,7 +1310,7 @@ void setupServerRoutes() {
 
         } else if (cmd == "save") {
             String dir  = req->hasParam("dir") ? req->getParam("dir")->value() : "A";
-            int    ms   = req->hasParam("ms")  ? constrain(req->getParam("ms")->value().toInt(), 50, 3000) : MOTOR_MOVE_MS;
+            int    ms   = req->hasParam("ms")  ? constrain(req->getParam("ms")->value().toInt(), 50, 5000) : MOTOR_MOVE_MS;
             motorMoveMs     = ms;
             motorDirSwapped = (dir == "B");
             prefs.putInt ("m_ms",  ms);
@@ -1318,6 +1446,7 @@ void setup() {
         }
 
         Serial.println("[SYS] Timer wake done — returning to deep sleep");
+        ring.clear(); ring.show();
         rtc_gpio_init(MOTOR_PWMA_GPIO);
         rtc_gpio_set_direction(MOTOR_PWMA_GPIO, RTC_GPIO_MODE_OUTPUT_ONLY);
         rtc_gpio_set_level(MOTOR_PWMA_GPIO, 0);
@@ -1328,6 +1457,10 @@ void setup() {
     }
 
     // ── Touch Wake / Boot: normal operation ─────────────────────────
+    ring.begin();
+    ring.setBrightness(60);
+    ring.show();
+
     pinMode(TOUCH_PIN,        INPUT_PULLDOWN);
     pinMode(BOOST_12V_EN_PIN, OUTPUT);
     pinMode(D0_PIN,           INPUT_PULLUP);
@@ -1346,7 +1479,7 @@ void setup() {
 
     prefs.begin("safe-app", false);
     motorMoveMs     = prefs.getInt ("m_ms",  MOTOR_MOVE_MS);
-    motorDirSwapped = prefs.getBool("m_dir", false);
+    motorDirSwapped = prefs.getBool("m_dir", true);
     Serial.printf("[MOTOR] moveMs=%d  dirSwapped=%d\n", motorMoveMs, motorDirSwapped);
 
     // Release RTC hold on MOTOR_PWMA after touch wake
@@ -1413,6 +1546,10 @@ void setup() {
         addLog("System started — reader active");
         Serial.println("[SYS] Boot — activating reader");
     }
+    // Ensure door is locked on every startup/wake
+    motorLock();
+    motorStopAt = millis() + motorMoveMs;
+
     setSystemState(READER_ACTIVE);
     activityTimer = millis();
 }
@@ -1421,10 +1558,15 @@ void setup() {
 // Loop
 // =====================================================================
 void loop() {
+    // LED ring update — non-blocking, max 50fps
+    static unsigned long lastLedMs = 0;
+    if (millis() - lastLedMs >= 20) { lastLedMs = millis(); ledUpdate(); }
+
     // Non-blocking motor stop (used by calib, lock, unlock)
     if (motorStopAt > 0 && millis() >= motorStopAt) {
         motorStop();
         motorStopAt = 0;
+        if (currentState == LOCK_OPEN) lockHoldStart = millis();
     }
 
     // MQTT keepalive
@@ -1460,15 +1602,28 @@ void loop() {
         }
     }
 
-    // Battery sampling every 10s; filtered average after 6 samples
+    // Battery sampling every 10s with per-sample outlier check
     if (currentState != READER_ACTIVE && millis() - lastBatSampleMs >= BAT_SAMPLE_MS) {
         lastBatSampleMs = millis();
-        batSamples[batSampleIdx++] = getBatteryInfo().vbat;
-        if (batSampleIdx >= BAT_SAMPLES) {
-            batSampleIdx = 0;
-            batVAvg   = filteredBatAverage(batSamples, BAT_SAMPLES);
-            batPctAvg = constrain((int)((batVAvg - 3.0f) / 1.2f * 100.0f), 0, 100);
-            Serial.printf("[BAT] Avg: %.3fV  %d%%\n", batVAvg, batPctAvg);
+        float v = takeBatReading();
+        bool valid = true;
+        if (!isnan(batVAvg) && fabsf(v - batVAvg) > BAT_OUTLIER_V) {
+            Serial.printf("[BAT] %.3fV deviates from avg %.3fV, resampling\n", v, batVAvg);
+            v = takeBatReading();
+            if (fabsf(v - batVAvg) > BAT_OUTLIER_V) {
+                Serial.printf("[BAT] Resample %.3fV also deviant, skipping\n", v);
+                valid = false;
+            }
+        }
+        if (valid) {
+            batSamples[batSampleIdx++] = v;
+            Serial.printf("[BAT] Sample[%d] %.3fV\n", batSampleIdx - 1, v);
+            if (batSampleIdx >= BAT_SAMPLES) {
+                batSampleIdx = 0;
+                batVAvg   = filteredBatAverage(batSamples, BAT_SAMPLES);
+                batPctAvg = constrain((int)((batVAvg - 3.0f) / 1.2f * 100.0f), 0, 100);
+                Serial.printf("[BAT] Avg: %.3fV  %d%%\n", batVAvg, batPctAvg);
+            }
         }
     }
 
@@ -1506,20 +1661,24 @@ void loop() {
                 if (finalCode == masterKey) {
                     editMode = !editMode;
                     stateTimer = millis(); activityTimer = millis();
+                    ledSetEffect(editMode ? LED_BLUE_FADE : LED_RAINBOW);
                     addLog(editMode ? "Edit mode ON" : "Edit mode OFF");
                 } else if (editMode) {
                     if (!cardExists(finalCode)) {
                         cardAdd(finalCode);
+                        ledSetEffect(LED_GREEN_BLINK, LED_BLUE_FADE);
                         char buf[48]; snprintf(buf, sizeof(buf), "Card #%u registered", finalCode);
                         addLog(buf);
                     } else {
                         cardRemove(finalCode);
+                        ledSetEffect(LED_RED_BLINK, LED_BLUE_FADE);
                         char buf[48]; snprintf(buf, sizeof(buf), "Card #%u removed", finalCode);
                         addLog(buf);
                     }
                     stateTimer = millis(); activityTimer = millis();
                 } else {
                     if (cardExists(finalCode)) {
+                        ledSetEffect(LED_GREEN_FADE, LED_OFF, 500);
                         setSystemState(LOCK_OPEN);
                         char buf[48]; snprintf(buf, sizeof(buf), "Opened: card #%u", finalCode);
                         addLog(buf);
@@ -1530,6 +1689,7 @@ void loop() {
                             mqttPublishState(cachedTemp, cachedHum, getBatteryPct(), false);
                         }
                     } else {
+                        ledSetEffect(LED_RED_FADE, LED_RAINBOW, 500);
                         char buf[52]; snprintf(buf, sizeof(buf), "Denied: card #%u", finalCode);
                         addLog(buf);
                         rtcAddRecord(cachedTemp, cachedHum, getBatteryPct(), 0, 3, finalCode);
@@ -1549,8 +1709,8 @@ void loop() {
         }
     }
 
-    // Auto-lock after LOCK_OPEN_MS
-    if (currentState == LOCK_OPEN && millis() - stateTimer > LOCK_OPEN_MS) {
+    // Auto-lock 10s after motor finishes opening
+    if (currentState == LOCK_OPEN && lockHoldStart > 0 && millis() - lockHoldStart > LOCK_HOLD_MS) {
         addLog("Door locked");
         setSystemState(IDLE);
         if (mqttClient.connected())
@@ -1565,6 +1725,7 @@ void loop() {
         WiFi.disconnect(true);
         WiFi.mode(WIFI_OFF);
         motorStandby();
+        ring.clear(); ring.show();
         rtc_gpio_init(MOTOR_PWMA_GPIO);
         rtc_gpio_set_direction(MOTOR_PWMA_GPIO, RTC_GPIO_MODE_OUTPUT_ONLY);
         rtc_gpio_set_level(MOTOR_PWMA_GPIO, 0);
