@@ -12,6 +12,8 @@
 #include <driver/rtc_io.h>
 #include <PubSubClient.h>
 #include <Adafruit_NeoPixel.h>
+#include <ArduinoOTA.h>
+#include <Update.h>
 
 // =====================================================================
 // Pin Map — ESP32-S3-WROOM-1 N16R8
@@ -185,6 +187,7 @@ uint32_t masterKey = 10311717;
 OneWire           oneWire(DHTPIN);
 DallasTemperature ds18(&oneWire);
 AsyncWebServer    server(80);
+AsyncEventSource  events("/events");
 Preferences       prefs;
 WiFiClient        wifiClient;
 WiFiMulti         wifiMulti;
@@ -216,12 +219,17 @@ LogEntry actLog[LOG_SIZE];
 int logHead = 0, logCount = 0;
 
 void addLog(const char* msg) {
-    strlcpy(actLog[logHead].msg, msg, sizeof(actLog[0].msg));
-    actLog[logHead].ts = (ntpEpoch > 0 && millis() >= ntpMillis)
+    uint32_t ts = (ntpEpoch > 0 && millis() >= ntpMillis)
         ? ntpEpoch + (uint32_t)((millis() - ntpMillis) / 1000)
         : (uint32_t)(millis() / 1000);
+    strlcpy(actLog[logHead].msg, msg, sizeof(actLog[0].msg));
+    actLog[logHead].ts = ts;
     logHead = (logHead + 1) % LOG_SIZE;
     if (logCount < LOG_SIZE) logCount++;
+    // Push to live SSE stream
+    char buf[160];
+    snprintf(buf, sizeof(buf), "{\"ts\":%lu,\"msg\":\"%s\"}", (unsigned long)ts, msg);
+    events.send(buf, "log", millis());
 }
 
 // =====================================================================
@@ -570,6 +578,8 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(
   <a href="/monitor">&#128270; Monitor</a>
   <a href="/graph">&#128200; History</a>
   <a href="/calib">&#9881; Calibration</a>
+  <a href="/logs">&#128221; Logs</a>
+  <a href="/update">&#11014; OTA</a>
 </div>
 <div class="sec">Authorized Cards</div>
 <div class="lst" id="cList"><div class="empty"><span class="spin"></span></div></div>
@@ -1005,6 +1015,142 @@ async function save(){
 )rawliteral";
 
 // =====================================================================
+// HTML — Live Log Stream
+// =====================================================================
+const char LOGS_PAGE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>Logs &#8212; SmartSafe</title>
+<style>
+:root{--bg:#0a0a14;--s1:#13131f;--bd:#2a2a45;--ac:#6366f1;--gr:#10b981;--rd:#ef4444;--yw:#f59e0b;--cy:#06b6d4;--tx:#e2e8f0;--tm:#64748b}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--tx);min-height:100vh;padding:16px;max-width:520px;margin:0 auto}
+.hdr{display:flex;align-items:center;justify-content:space-between;padding:14px 0 20px;border-bottom:1px solid var(--bd);margin-bottom:16px}
+.hdr h1{font-size:1.15rem;font-weight:700}
+.back{color:var(--ac);font-size:.78rem;text-decoration:none;padding:5px 11px;border:1px solid var(--bd);border-radius:8px}
+.bar{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+.badge{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:12px;font-size:.65rem;font-weight:600}
+.badge.live{background:rgba(16,185,129,.12);color:var(--gr);border:1px solid rgba(16,185,129,.3)}
+.badge.off{background:rgba(100,116,139,.15);color:var(--tm);border:1px solid rgba(100,116,139,.3)}
+.dot{width:6px;height:6px;border-radius:50%;display:inline-block}
+.dot.on{background:var(--gr)}.dot.off-c{background:var(--tm)}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.25}}
+.badge.live .dot{animation:blink .85s ease-in-out infinite}
+#log{background:var(--s1);border:1px solid var(--bd);border-radius:12px;padding:12px;min-height:300px;max-height:68vh;overflow-y:auto;font-family:monospace;font-size:.74rem}
+.en{display:flex;gap:10px;padding:4px 0;border-bottom:1px solid rgba(42,42,69,.4)}
+.en:last-child{border-bottom:none}
+.ts{color:var(--tm);flex-shrink:0;min-width:62px}
+.m.ok{color:var(--gr)}.m.er{color:var(--rd)}.m.in{color:var(--tx)}
+.btn{background:none;border:1px solid var(--bd);color:var(--tm);border-radius:8px;padding:5px 12px;font-size:.74rem;cursor:pointer}
+.btn:hover{border-color:var(--rd);color:var(--rd)}
+</style>
+</head>
+<body>
+<div class="hdr">
+  <h1>&#128221; Live Logs</h1>
+  <a class="back" href="/">&#8592; Back</a>
+</div>
+<div class="bar">
+  <span id="badge" class="badge off"><span class="dot off-c" id="dot"></span><span id="bl">Connecting...</span></span>
+  <button class="btn" onclick="document.getElementById('log').innerHTML=''">Clear</button>
+</div>
+<div id="log"></div>
+<script>
+const el=document.getElementById('log');
+function fmt(ts){if(ts>86400){return new Date(ts*1000).toLocaleTimeString();}return('0'+Math.floor(ts/3600)).slice(-2)+':'+('0'+Math.floor((ts%3600)/60)).slice(-2)+':'+('0'+(ts%60)).slice(-2);}
+function cls(m){return(m.includes('open')||m.includes('Opened')||m.includes('unlock'))?'ok':(m.includes('denied')||m.includes('Denied')||m.includes('Invalid')||m.includes('FAILED'))?'er':'in';}
+function append(ts,msg,prepend){const e=document.createElement('div');e.className='en';e.innerHTML='<span class="ts">'+fmt(ts)+'</span><span class="m '+cls(msg)+'">'+msg+'</span>';prepend?el.insertBefore(e,el.firstChild):el.appendChild(e);if(!prepend)el.scrollTop=el.scrollHeight;}
+fetch('/api/log').then(r=>r.json()).then(d=>{if(d.log)d.log.forEach(e=>append(e.ts,e.msg,false));}).catch(()=>{});
+const src=new EventSource('/events');
+src.addEventListener('log',e=>{try{const d=JSON.parse(e.data);append(d.ts,d.msg,false);}catch(ex){}});
+src.onopen=()=>{const b=document.getElementById('badge'),d=document.getElementById('dot'),l=document.getElementById('bl');b.className='badge live';d.className='dot on';l.textContent='Live';};
+src.onerror=()=>{const b=document.getElementById('badge'),d=document.getElementById('dot'),l=document.getElementById('bl');b.className='badge off';d.className='dot off-c';l.textContent='Disconnected';};
+</script>
+</body>
+</html>
+)rawliteral";
+
+// =====================================================================
+// HTML — OTA Update
+// =====================================================================
+const char OTA_PAGE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>OTA Update &#8212; SmartSafe</title>
+<style>
+:root{--bg:#0a0a14;--s1:#13131f;--bd:#2a2a45;--ac:#6366f1;--gr:#10b981;--rd:#ef4444;--yw:#f59e0b;--tx:#e2e8f0;--tm:#64748b}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--tx);min-height:100vh;padding:16px;max-width:480px;margin:0 auto}
+.hdr{display:flex;align-items:center;justify-content:space-between;padding:14px 0 20px;border-bottom:1px solid var(--bd);margin-bottom:24px}
+.hdr h1{font-size:1.15rem;font-weight:700}
+.back{color:var(--ac);font-size:.78rem;text-decoration:none;padding:5px 11px;border:1px solid var(--bd);border-radius:8px}
+.card{background:var(--s1);border:1px solid var(--bd);border-radius:12px;padding:20px;margin-bottom:16px}
+.card h2{font-size:.85rem;font-weight:600;margin-bottom:14px;color:var(--tx)}
+.card p{font-size:.76rem;color:var(--tm);margin-bottom:14px;line-height:1.5}
+.drop{border:2px dashed var(--bd);border-radius:10px;padding:30px;text-align:center;cursor:pointer;transition:border .2s}
+.drop:hover,.drop.over{border-color:var(--ac)}
+.drop input{display:none}
+.drop-lbl{font-size:.8rem;color:var(--tm)}
+.drop-name{font-size:.8rem;color:var(--ac);margin-top:6px;font-weight:600}
+.btn{width:100%;margin-top:14px;background:var(--ac);color:#fff;border:none;border-radius:8px;padding:11px;font-size:.85rem;font-weight:600;cursor:pointer;transition:opacity .2s}
+.btn:disabled{opacity:.4;cursor:default}
+.prog{margin-top:14px;display:none}
+.prog-bar{height:6px;background:var(--bd);border-radius:3px;overflow:hidden}
+.prog-fill{height:100%;width:0;background:var(--ac);transition:width .3s}
+.prog-txt{font-size:.72rem;color:var(--tm);margin-top:6px;text-align:center}
+.msg{margin-top:12px;font-size:.8rem;text-align:center;padding:8px;border-radius:8px;display:none}
+.msg.ok{background:rgba(16,185,129,.12);color:var(--gr);border:1px solid rgba(16,185,129,.3)}
+.msg.er{background:rgba(239,68,68,.1);color:var(--rd);border:1px solid rgba(239,68,68,.3)}
+.warn{background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.3);border-radius:8px;padding:10px 12px;font-size:.74rem;color:var(--yw);margin-bottom:16px}
+</style>
+</head>
+<body>
+<div class="hdr">
+  <h1>&#11014; OTA Firmware Update</h1>
+  <a class="back" href="/">&#8592; Back</a>
+</div>
+<div class="warn">&#9888; The device will reboot after a successful upload. Ensure the door is locked before updating.</div>
+<div class="card">
+  <h2>Upload Firmware (.bin)</h2>
+  <p>Select the compiled firmware file from PlatformIO: <code style="color:var(--ac)">.pio/build/esp32s3/firmware.bin</code></p>
+  <div class="drop" id="drop" onclick="document.getElementById('file').click()" ondragover="event.preventDefault();this.classList.add('over')" ondragleave="this.classList.remove('over')" ondrop="onDrop(event)">
+    <input type="file" id="file" accept=".bin" onchange="onFile(this.files[0])">
+    <div class="drop-lbl">&#128194; Click or drop .bin file here</div>
+    <div class="drop-name" id="fname"></div>
+  </div>
+  <button class="btn" id="btn" disabled onclick="doUpload()">Upload &amp; Update</button>
+  <div class="prog" id="prog"><div class="prog-bar"><div class="prog-fill" id="fill"></div></div><div class="prog-txt" id="ptxt">0%</div></div>
+  <div class="msg" id="msg"></div>
+</div>
+<script>
+let file=null;
+function onDrop(e){e.preventDefault();document.getElementById('drop').classList.remove('over');onFile(e.dataTransfer.files[0]);}
+function onFile(f){if(!f||!f.name.endsWith('.bin'))return;file=f;document.getElementById('fname').textContent=f.name+' ('+Math.round(f.size/1024)+' KB)';document.getElementById('btn').disabled=false;}
+function showMsg(txt,ok){const m=document.getElementById('msg');m.textContent=txt;m.className='msg '+(ok?'ok':'er');m.style.display='block';}
+function doUpload(){
+  if(!file)return;
+  const btn=document.getElementById('btn');btn.disabled=true;
+  const fd=new FormData();fd.append('firmware',file,file.name);
+  const xhr=new XMLHttpRequest();
+  xhr.open('POST','/update');
+  xhr.upload.onprogress=e=>{if(e.lengthComputable){const p=Math.round(e.loaded/e.total*100);document.getElementById('fill').style.width=p+'%';document.getElementById('ptxt').textContent=p+'%';}};
+  document.getElementById('prog').style.display='block';
+  xhr.onload=()=>{if(xhr.status===200&&xhr.responseText.startsWith('OK')){showMsg('Success! Device rebooting...  Reconnect in ~5s.',true);}else{showMsg('Upload failed: '+xhr.responseText,false);btn.disabled=false;}};
+  xhr.onerror=()=>{showMsg('Connection error',false);btn.disabled=false;};
+  xhr.send(fd);
+}
+</script>
+</body>
+</html>
+)rawliteral";
+
+// =====================================================================
 // ISR — Wiegand RFID
 // =====================================================================
 void IRAM_ATTR rfid_isr_d0() {
@@ -1380,6 +1526,46 @@ void setupServerRoutes() {
         json += "}";
         req->send(200, "application/json", json);
     });
+
+    server.on("/logs", HTTP_GET, [](AsyncWebServerRequest *req) {
+        if (!req->authenticate(www_username, www_password)) return req->requestAuthentication();
+        req->send_P(200, "text/html", LOGS_PAGE);
+    });
+
+    // SSE endpoint — no per-connection auth (page itself is auth-gated)
+    events.onConnect([](AsyncEventSourceClient *client) {
+        client->send("connected", "info", millis());
+    });
+    server.addHandler(&events);
+
+    // OTA web upload — GET shows upload form, POST receives firmware
+    server.on("/update", HTTP_GET, [](AsyncWebServerRequest *req) {
+        if (!req->authenticate(www_username, www_password)) return req->requestAuthentication();
+        req->send_P(200, "text/html", OTA_PAGE);
+    });
+    server.on("/update", HTTP_POST,
+        [](AsyncWebServerRequest *req) {
+            bool ok = !Update.hasError();
+            AsyncWebServerResponse *resp = req->beginResponse(200, "text/plain",
+                ok ? "OK — rebooting..." : "FAILED");
+            resp->addHeader("Connection", "close");
+            req->send(resp);
+            if (ok) { delay(300); ESP.restart(); }
+        },
+        [](AsyncWebServerRequest *req, String filename, size_t index, uint8_t *data, size_t len, bool final) {
+            if (!req->authenticate(www_username, www_password)) { req->send(401); return; }
+            if (!index) {
+                Serial.printf("[OTA] Uploading: %s\n", filename.c_str());
+                int cmd = filename.indexOf("spiffs") > -1 ? U_SPIFFS : U_FLASH;
+                if (!Update.begin(UPDATE_SIZE_UNKNOWN, cmd)) Update.printError(Serial);
+            }
+            if (Update.write(data, len) != len) Update.printError(Serial);
+            if (final) {
+                if (Update.end(true)) Serial.printf("[OTA] Done: %u bytes\n", index + len);
+                else Update.printError(Serial);
+            }
+        }
+    );
 }
 
 // =====================================================================
@@ -1529,6 +1715,17 @@ void setup() {
             mqttFlushBuffer();
             mqttPublishState(cachedTemp, cachedHum, getBatteryPct(), true);
         }
+
+        ArduinoOTA.setHostname("smartsafe");
+        ArduinoOTA.setPassword(www_password);
+        ArduinoOTA.onStart([]() {
+            Serial.println("[OTA] Start");
+            motorStop(); motorStopAt = 0;
+        });
+        ArduinoOTA.onEnd([]()   { Serial.println("[OTA] Done — rebooting"); });
+        ArduinoOTA.onError([](ota_error_t e) { Serial.printf("[OTA] Error %u\n", e); });
+        ArduinoOTA.begin();
+        Serial.println("[OTA] ArduinoOTA ready");
     } else {
         Serial.println("[WiFi] Connection FAILED");
     }
@@ -1558,6 +1755,8 @@ void setup() {
 // Loop
 // =====================================================================
 void loop() {
+    ArduinoOTA.handle();
+
     // LED ring update — non-blocking, max 50fps
     static unsigned long lastLedMs = 0;
     if (millis() - lastLedMs >= 20) { lastLedMs = millis(); ledUpdate(); }
