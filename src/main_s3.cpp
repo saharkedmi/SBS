@@ -12,6 +12,7 @@
 #include <driver/rtc_io.h>
 #include <PubSubClient.h>
 #include <Adafruit_NeoPixel.h>
+#include <ESP32Servo.h>
 
 // =====================================================================
 // Pin Map — ESP32-S3-WROOM-1 N16R8
@@ -26,28 +27,23 @@
 #define BOOST_12V_EN_PIN 14
 #define DHTPIN           16   // DS18B20 OneWire
 #define BAT_ADC          4    // ADC1_CH3 — works with WiFi on
-#define MOTOR_PWMA       8    // PWM speed — RTC GPIO, held LOW during sleep
-#define MOTOR_AIN1       18   // Direction 1
-#define MOTOR_AIN2       15   // Direction 2  (NOT 19 — USB D-)
-#define MOTOR_STBY       17   // STBY: LOW=1µA sleep, HIGH=active
+#define SERVO_PIN        8    // Servo PWM signal — RTC GPIO, held LOW during sleep
 #define LED_PIN          6    // WS2812B data
 #define LED_COUNT        12
 
 // Compile-time GPIO enum constants required by RTC/sleep API
-#define MOTOR_PWMA_GPIO  GPIO_NUM_8
+#define SERVO_PIN_GPIO   GPIO_NUM_8
 #define TOUCH_GPIO       GPIO_NUM_7
 
 // =====================================================================
 // Timing
 // =====================================================================
-#define LOCK_HOLD_MS        10000  // hold time AFTER motor finishes opening
+#define LOCK_HOLD_MS        10000  // hold time after servo reaches open position
 #define LOCK_COOLDOWN_MS    2000
 #define READER_TIMEOUT_MS   15000
 #define WIEGAND_TIMEOUT_US  200000
 #define BOOSTER_SETTLING_MS 80
-
-#define MOTOR_MOVE_MS    5000   // default ms to complete lock/unlock stroke
-#define MAX_PWM          150    // 60% duty — limits 5V supply to ~3V for N20
+#define SERVO_DETACH_MS     1500   // ms after write before detaching servo
 
 #define SLEEP_TIMEOUT_MS        300000
 #define REPORT_INTERVAL_US      (10ULL * 60ULL * 1000000ULL)
@@ -253,11 +249,12 @@ unsigned long lastBatSampleMs = 0;
 unsigned long lastMqttMs      = 0;
 unsigned long lastPlogMs      = 0;
 
-// Motor runtime config — loaded from Preferences, tunable via /calib
-int           motorMoveMs     = MOTOR_MOVE_MS;
-bool          motorDirSwapped = true;           // true → A=lock, B=unlock
-volatile unsigned long motorStopAt = 0;
-unsigned long          lockHoldStart = 0;   // set when motor finishes opening
+// Servo runtime config — loaded from Preferences, tunable via /calib
+bool          motorDirSwapped = true;   // true → A(0°)=lock, B(180°)=unlock
+unsigned long lockHoldStart   = 0;
+unsigned long servoDetachAt   = 0;
+
+Servo servo;
 
 // =====================================================================
 // Activity Log
@@ -493,38 +490,20 @@ bool connectMQTT() {
 // Motor Control — TB6612FNG + N20 3V @ 5V supply
 // MAX_PWM=150 caps duty at 60% → ~3V effective (protects motor coils)
 // =====================================================================
-void motorForward() {
-    digitalWrite(MOTOR_STBY, HIGH);
-    digitalWrite(MOTOR_AIN1, HIGH);
-    digitalWrite(MOTOR_AIN2, LOW);
-    analogWrite(MOTOR_PWMA, MAX_PWM);
+// Servo Control — angular servo on SERVO_PIN (GPIO 8)
+// A = 0 deg, B = 180 deg. motorDirSwapped: true -> A(0)=lock, B(180)=unlock
+// =====================================================================
+void servoUnlock() {
+    int angle = motorDirSwapped ? 180 : 0;
+    Serial.printf("[SERVO] Unlock -> %d deg\n", angle);
+    servo.attach(SERVO_PIN);
+    servo.write(angle);
 }
-
-void motorReverse() {
-    digitalWrite(MOTOR_STBY, HIGH);
-    digitalWrite(MOTOR_AIN1, LOW);
-    digitalWrite(MOTOR_AIN2, HIGH);
-    analogWrite(MOTOR_PWMA, MAX_PWM);
-}
-
-void motorStop() {
-    analogWrite(MOTOR_PWMA, 0);
-    digitalWrite(MOTOR_AIN1, LOW);
-    digitalWrite(MOTOR_AIN2, LOW);
-}
-
-void motorStandby() {
-    motorStop();
-    digitalWrite(MOTOR_STBY, LOW);
-}
-
-void motorUnlock() {
-    Serial.printf("[MOTOR] Unlock — dir=%s ms=%d\n", motorDirSwapped?"B":"A", motorMoveMs);
-    motorDirSwapped ? motorReverse() : motorForward();
-}
-void motorLock() {
-    Serial.printf("[MOTOR] Lock — dir=%s ms=%d\n", motorDirSwapped?"A":"B", motorMoveMs);
-    motorDirSwapped ? motorForward() : motorReverse();
+void servoLock() {
+    int angle = motorDirSwapped ? 0 : 180;
+    Serial.printf("[SERVO] Lock -> %d deg\n", angle);
+    servo.attach(SERVO_PIN);
+    servo.write(angle);
 }
 
 // =====================================================================
@@ -984,7 +963,7 @@ const char CALIB_PAGE[] PROGMEM = R"rawliteral(
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
-<title>Motor Calibration &#8212; SmartSafe</title>
+<title>Servo Calibration &#8212; SmartSafe</title>
 <style>
 :root{--bg:#0a0a14;--s1:#13131f;--bd:#2a2a45;--ac:#6366f1;--gr:#10b981;--rd:#ef4444;--yw:#f59e0b;--tx:#e2e8f0;--tm:#64748b}
 *{box-sizing:border-box;margin:0;padding:0}
@@ -994,10 +973,7 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(
 .back{color:var(--ac);font-size:.78rem;text-decoration:none;padding:5px 11px;border:1px solid var(--bd);border-radius:8px}
 .sec{font-size:.62rem;text-transform:uppercase;letter-spacing:.1em;color:var(--tm);margin:16px 0 6px}
 .card{background:var(--s1);border:1px solid var(--bd);border-radius:12px;padding:16px;margin-bottom:8px}
-.lbl{color:var(--tm);font-size:.65rem;margin-bottom:6px}
-.ms-big{font-size:1.6rem;font-weight:700;font-family:monospace;color:var(--yw);margin:4px 0 10px}
-input[type=range]{width:100%;accent-color:var(--ac);cursor:pointer;margin-bottom:4px}
-input[type=number]{width:100%;padding:10px 12px;background:var(--bg);border:1px solid var(--bd);border-radius:8px;color:var(--tx);font-size:1.1rem;font-family:monospace;margin-bottom:12px;text-align:center}
+.lbl{color:var(--tm);font-size:.65rem;margin-bottom:8px}
 .row{display:flex;gap:8px;margin-top:10px}
 .btn{flex:1;padding:14px 6px;border:none;border-radius:10px;font-size:.9rem;font-weight:700;cursor:pointer;transition:opacity .15s}
 .btn:active{opacity:.65}.btn:disabled{opacity:.3;cursor:not-allowed}
@@ -1014,44 +990,41 @@ input[type=number]{width:100%;padding:10px 12px;background:var(--bg);border:1px 
 .msg-ok{background:rgba(16,185,129,.1);color:var(--gr);border:1px solid rgba(16,185,129,.2)}
 .msg-er{background:rgba(239,68,68,.1);color:var(--rd);border:1px solid rgba(239,68,68,.2)}
 .step-num{font-size:.65rem;color:var(--ac);font-weight:700;text-transform:uppercase;letter-spacing:.08em}
+.angle{font-size:1.4rem;font-weight:700;font-family:monospace;color:var(--yw);margin-bottom:4px}
 </style>
 </head>
 <body>
 <div class="hdr">
-  <div><h1>&#9881; Motor Calibration</h1></div>
+  <div><h1>&#9881; Servo Calibration</h1></div>
   <a href="/" class="back">&#8592; Dashboard</a>
 </div>
 
 <div class="step-num">Step 1</div>
-<div class="sec">Test directions</div>
+<div class="sec">Test positions</div>
 <div class="card">
-  <div class="lbl">Test duration</div>
-  <div class="ms-big" id="msDsp">1000ms</div>
-  <input type="range" id="msSlider" min="100" max="2000" step="50" value="1000"
-         oninput="document.getElementById('msDsp').textContent=this.value+'ms'">
+  <div class="lbl">Move servo to each endpoint to see which physically opens/closes the lock</div>
   <div class="row">
-    <button class="btn ba" onclick="runDir('fwd')">&#9654; Direction A (Forward)</button>
-    <button class="btn bb" onclick="runDir('rev')">&#9654; Direction B (Reverse)</button>
-    <button class="btn bstop" onclick="doStop()" title="Stop">&#9632;</button>
+    <button class="btn ba" onclick="api('cmd=posA')">&#9654; Position A &mdash; 0&deg;</button>
+    <button class="btn bb" onclick="api('cmd=posB')">&#9654; Position B &mdash; 180&deg;</button>
+    <button class="btn bstop" onclick="api('cmd=stop')" title="Detach">&#9632;</button>
   </div>
 </div>
 
 <div class="step-num">Step 2</div>
-<div class="sec">Set open direction</div>
+<div class="sec">Set open position</div>
 <div class="card">
-  <div class="lbl">Select which direction opens the lock</div>
+  <div class="lbl">Select which position opens the lock</div>
   <div class="row">
-    <button class="btn ba" onclick="setDir('A')">A = Open &#10003;</button>
-    <button class="btn bb" onclick="setDir('B')">B = Open &#10003;</button>
+    <button class="btn ba" onclick="setDir('A')">A (0&deg;) = Open &#10003;</button>
+    <button class="btn bb" onclick="setDir('B')">B (180&deg;) = Open &#10003;</button>
   </div>
   <div id="dirChip"><span class="chip chip-none">Not set yet</span></div>
 </div>
 
 <div class="step-num">Step 3</div>
-<div class="sec">Tune duration</div>
+<div class="sec">Test open / close</div>
 <div class="card">
-  <div class="lbl">ms until latch reaches end — increase if incomplete, decrease if motor stalls under pressure</div>
-  <input type="number" id="saveMs" min="100" max="3000" step="50" value="1000">
+  <div class="lbl">Verify both positions work correctly</div>
   <div class="row">
     <button class="btn bopen" id="btnOpen" onclick="testAction('open')" disabled>&#9654; Test Open</button>
     <button class="btn bstop" id="btnClose" onclick="testAction('close')" disabled style="flex:1">&#9654; Test Close</button>
@@ -1067,27 +1040,23 @@ input[type=number]{width:100%;padding:10px 12px;background:var(--bg);border:1px 
 
 <script>
 let unlockDir=null;
-function ms(){return parseInt(document.getElementById('msSlider').value);}
-function sms(){return parseInt(document.getElementById('saveMs').value);}
 async function api(p){try{const r=await fetch('/api/calib?'+p);return await r.json();}catch(e){return{ok:false};}}
-function runDir(d){api('cmd='+d+'&ms='+ms());}
-function doStop(){api('cmd=stop');}
 function setDir(d){
   unlockDir=d;
-  document.getElementById('dirChip').innerHTML='<span class="chip chip-ok">Direction '+d+' = Open &#10003;</span>';
+  document.getElementById('dirChip').innerHTML='<span class="chip chip-ok">Position '+d+(d==='A'?' (0&deg;)':' (180&deg;)')+' = Open &#10003;</span>';
   document.getElementById('btnOpen').disabled=false;
   document.getElementById('btnClose').disabled=false;
   document.getElementById('btnSave').disabled=false;
 }
 function testAction(a){
-  const isFwd=(a==='open')?(unlockDir==='A'):(unlockDir==='B');
-  api('cmd='+(isFwd?'fwd':'rev')+'&ms='+sms());
+  const isA=(a==='open')?(unlockDir==='A'):(unlockDir==='B');
+  api('cmd='+(isA?'posA':'posB'));
 }
 async function save(){
-  const r=await api('cmd=save&dir='+unlockDir+'&ms='+sms());
+  const r=await api('cmd=save&dir='+unlockDir);
   const el=document.getElementById('saveMsg');
   el.innerHTML=r&&r.ok
-    ?'<div class="msg msg-ok">&#10003; Saved! Direction '+unlockDir+' opens &middot; '+sms()+'ms</div>'
+    ?'<div class="msg msg-ok">&#10003; Saved! Position '+unlockDir+(unlockDir==='A'?' (0&deg;)':' (180&deg;)')+' opens the lock</div>'
     :'<div class="msg msg-er">&#10007; Save failed</div>';
 }
 </script>
@@ -1226,8 +1195,8 @@ void setSystemState(SystemState newState) {
         digitalWrite(BOOST_12V_EN_PIN, LOW);
         if (prevState == LOCK_OPEN) {
             plogAdd(cachedTemp, (uint8_t)constrain(batPctAvg >= 0 ? batPctAvg : getBatteryPct(), 0, 100), 2);
-            motorLock();
-            motorStopAt = millis() + motorMoveMs;
+            servoLock();
+            servoDetachAt = millis() + SERVO_DETACH_MS;
         }
         editMode = false;
         ledSetEffect(LED_OFF);
@@ -1241,8 +1210,8 @@ void setSystemState(SystemState newState) {
         Serial.println("[FSM] READER_ACTIVE");
     } else if (newState == LOCK_OPEN) {
         plogAdd(cachedTemp, (uint8_t)constrain(batPctAvg >= 0 ? batPctAvg : getBatteryPct(), 0, 100), 1);
-        motorUnlock();
-        motorStopAt = millis() + motorMoveMs;
+        servoUnlock();
+        lockHoldStart = millis();
         digitalWrite(BOOST_12V_EN_PIN, LOW);
         lastUnlockTime = millis();
         Serial.println("[FSM] LOCK_OPEN — unlocking");
@@ -1385,31 +1354,25 @@ void setupServerRoutes() {
         if (!req->authenticate(www_username, www_password)) return req->requestAuthentication();
         String cmd = req->hasParam("cmd") ? req->getParam("cmd")->value() : "";
 
-        if (cmd == "fwd") {
-            int ms = req->hasParam("ms") ? constrain(req->getParam("ms")->value().toInt(), 50, 3000) : 600;
-            motorForward();
-            motorStopAt = millis() + ms;
+        if (cmd == "posA") {
+            servo.attach(SERVO_PIN);
+            servo.write(0);
             req->send(200, "application/json", "{\"ok\":true}");
 
-        } else if (cmd == "rev") {
-            int ms = req->hasParam("ms") ? constrain(req->getParam("ms")->value().toInt(), 50, 3000) : 600;
-            motorReverse();
-            motorStopAt = millis() + ms;
+        } else if (cmd == "posB") {
+            servo.attach(SERVO_PIN);
+            servo.write(180);
             req->send(200, "application/json", "{\"ok\":true}");
 
         } else if (cmd == "stop") {
-            motorStopAt = 0;
-            motorStop();
+            servo.detach();
             req->send(200, "application/json", "{\"ok\":true}");
 
         } else if (cmd == "save") {
             String dir  = req->hasParam("dir") ? req->getParam("dir")->value() : "A";
-            int    ms   = req->hasParam("ms")  ? constrain(req->getParam("ms")->value().toInt(), 50, 5000) : MOTOR_MOVE_MS;
-            motorMoveMs     = ms;
             motorDirSwapped = (dir == "B");
-            prefs.putInt ("m_ms",  ms);
             prefs.putBool("m_dir", motorDirSwapped);
-            Serial.printf("[CALIB] saved: dir=%s ms=%d\n", dir.c_str(), ms);
+            Serial.printf("[CALIB] saved: dir=%s\n", dir.c_str());
             req->send(200, "application/json", "{\"ok\":true}");
 
         } else {
@@ -1541,10 +1504,10 @@ void setup() {
 
         Serial.println("[SYS] Timer wake done — returning to deep sleep");
         ring.clear(); ring.show();
-        rtc_gpio_init(MOTOR_PWMA_GPIO);
-        rtc_gpio_set_direction(MOTOR_PWMA_GPIO, RTC_GPIO_MODE_OUTPUT_ONLY);
-        rtc_gpio_set_level(MOTOR_PWMA_GPIO, 0);
-        rtc_gpio_hold_en(MOTOR_PWMA_GPIO);
+        rtc_gpio_init(SERVO_PIN_GPIO);
+        rtc_gpio_set_direction(SERVO_PIN_GPIO, RTC_GPIO_MODE_OUTPUT_ONLY);
+        rtc_gpio_set_level(SERVO_PIN_GPIO, 0);
+        rtc_gpio_hold_en(SERVO_PIN_GPIO);
         esp_sleep_enable_ext0_wakeup(TOUCH_GPIO, 1);
         esp_sleep_enable_timer_wakeup(REPORT_INTERVAL_US);
         esp_deep_sleep_start();
@@ -1561,28 +1524,22 @@ void setup() {
     pinMode(D1_PIN,           INPUT_PULLUP);
     digitalWrite(BOOST_12V_EN_PIN, LOW);
 
-    // Motor pins
-    pinMode(MOTOR_PWMA, OUTPUT);
-    pinMode(MOTOR_AIN1, OUTPUT);
-    pinMode(MOTOR_AIN2, OUTPUT);
-    pinMode(MOTOR_STBY, OUTPUT);
-    motorStandby();
+    pinMode(SERVO_PIN, OUTPUT);
 
     attachInterrupt(digitalPinToInterrupt(D0_PIN), rfid_isr_d0, FALLING);
     attachInterrupt(digitalPinToInterrupt(D1_PIN), rfid_isr_d1, FALLING);
 
     prefs.begin("safe-app", false);
-    motorMoveMs     = prefs.getInt ("m_ms",  MOTOR_MOVE_MS);
     motorDirSwapped = prefs.getBool("m_dir", true);
-    Serial.printf("[MOTOR] moveMs=%d  dirSwapped=%d\n", motorMoveMs, motorDirSwapped);
+    Serial.printf("[SERVO] dirSwapped=%d\n", motorDirSwapped);
 
     plogLoad();
     plogAdd(NAN, (uint8_t)constrain(getBatteryPct(), 0, 100), 4); // boot event
 
-    // Release RTC hold on MOTOR_PWMA after touch wake
+    // Release RTC hold on servo pin after touch wake
     if (wakeReason == WAKE_TOUCH) {
-        rtc_gpio_hold_dis(MOTOR_PWMA_GPIO);
-        rtc_gpio_deinit(MOTOR_PWMA_GPIO);
+        rtc_gpio_hold_dis(SERVO_PIN_GPIO);
+        rtc_gpio_deinit(SERVO_PIN_GPIO);
     }
 
     ds18.begin();
@@ -1644,8 +1601,8 @@ void setup() {
         Serial.println("[SYS] Boot — activating reader");
     }
     // Ensure door is locked on every startup/wake
-    motorLock();
-    motorStopAt = millis() + motorMoveMs;
+    servoLock();
+    servoDetachAt = millis() + SERVO_DETACH_MS;
 
     setSystemState(READER_ACTIVE);
     activityTimer = millis();
@@ -1659,11 +1616,11 @@ void loop() {
     static unsigned long lastLedMs = 0;
     if (millis() - lastLedMs >= 20) { lastLedMs = millis(); ledUpdate(); }
 
-    // Non-blocking motor stop (used by calib, lock, unlock)
-    if (motorStopAt > 0 && millis() >= motorStopAt) {
-        motorStop();
-        motorStopAt = 0;
-        if (currentState == LOCK_OPEN) lockHoldStart = millis();
+    // Detach servo after it has had time to reach position
+    if (servoDetachAt > 0 && millis() >= servoDetachAt) {
+        servo.detach();
+        servoDetachAt = 0;
+        Serial.println("[SERVO] Detached");
     }
 
     // MQTT keepalive
@@ -1827,12 +1784,12 @@ void loop() {
                       (millis() - activityTimer) / 1000);
         WiFi.disconnect(true);
         WiFi.mode(WIFI_OFF);
-        motorStandby();
+        servo.detach();
         ring.clear(); ring.show();
-        rtc_gpio_init(MOTOR_PWMA_GPIO);
-        rtc_gpio_set_direction(MOTOR_PWMA_GPIO, RTC_GPIO_MODE_OUTPUT_ONLY);
-        rtc_gpio_set_level(MOTOR_PWMA_GPIO, 0);
-        rtc_gpio_hold_en(MOTOR_PWMA_GPIO);
+        rtc_gpio_init(SERVO_PIN_GPIO);
+        rtc_gpio_set_direction(SERVO_PIN_GPIO, RTC_GPIO_MODE_OUTPUT_ONLY);
+        rtc_gpio_set_level(SERVO_PIN_GPIO, 0);
+        rtc_gpio_hold_en(SERVO_PIN_GPIO);
         esp_sleep_enable_ext0_wakeup(TOUCH_GPIO, 1);
         esp_sleep_enable_timer_wakeup(REPORT_INTERVAL_US);
         esp_deep_sleep_start();
