@@ -1,6 +1,5 @@
 #include <Arduino.h>
 #include <WiFi.h>
-#include <WiFiMulti.h>
 #include <ESPAsyncWebServer.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
@@ -13,6 +12,12 @@
 #include <PubSubClient.h>
 #include <Adafruit_NeoPixel.h>
 #include <ESP32Servo.h>
+#include <Update.h>
+#include <DNSServer.h>
+#include <esp_ota_ops.h>
+#include <driver/gpio.h>
+
+#define FW_VERSION "2.2.0"
 
 // =====================================================================
 // Pin Map — ESP32-S3-WROOM-1 N16R8
@@ -47,7 +52,12 @@
 
 #define SLEEP_TIMEOUT_MS        300000
 #define REPORT_INTERVAL_US      (10ULL * 60ULL * 1000000ULL)
-#define WIFI_CONNECT_TIMEOUT_MS 10000
+#define WIFI_CONNECT_TIMEOUT_MS 20000  // total budget, blocking (timer wake only)
+#define WIFI_TRY_MS             8000   // per-network attempt, non-blocking
+#define WIFI_RETRY_MS           20000  // retry period after all networks failed
+#define AP_SSID                 "SBS"
+#define AP_TIMEOUT_MS           120000 // close AP if no client joined within 2 min
+#define MQTT_RETRY_MS           30000
 
 #define BAT_SAMPLE_MS    10000UL
 #define BAT_SAMPLES      6
@@ -57,16 +67,21 @@
 // =====================================================================
 // Network
 // =====================================================================
-const char* ssid         = "Your_WiFi_SSID";
-const char* password     = "Your_WiFi_Password";
-const char* www_username = "admin";
-const char* www_password = "Your_Web_Password";
-const char* api_token    = "Your_API_Token";
+// WiFi seed — copied into the NVS network list on first boot only.
+// Real values live in NVS: configure via the /settings and /wifi pages
+// (or the SBS setup AP on a fresh device).
+const char* ssid     = "Your_WiFi_SSID";
+const char* password = "Your_WiFi_Password";
 
-const char* mqtt_server   = "Your_MQTT_Server";
-const int   mqtt_port     = 1883;
-const char* mqtt_user     = "Your_MQTT_User";
-const char* mqtt_pass     = "Your_MQTT_Pass";
+// Runtime settings — first-boot defaults; overridden from NVS via /settings
+char www_username[24] = "admin";
+char www_password[32] = "Your_Web_Password";
+char api_token[33]    = "Your_API_Token";
+char mqtt_server[40]  = "Your_MQTT_Server";
+int  mqtt_port        = 1883;
+char mqtt_user[24]    = "Your_MQTT_User";
+char mqtt_pass[32]    = "Your_MQTT_Pass";
+
 const char* mqtt_clientid = "smartsafe_pro";
 
 #define MQTT_STATE_TOPIC  "smartsafe/state"
@@ -174,6 +189,11 @@ PLogRecord plogBuf[PLOG_MAX];
 int plogHead  = 0;
 int plogCount = 0;
 
+// Records written before NTP sync carry relative timestamps; remember
+// them so they can be corrected retroactively once the clock is known.
+uint8_t plogUnsynced[8];
+int     plogUnsyncedCnt = 0;
+
 void plogLoad() {
     if (prefs.getBytesLength("pl_d") == sizeof(plogBuf)) {
         prefs.getBytes("pl_d", plogBuf, sizeof(plogBuf));
@@ -196,10 +216,27 @@ void plogAdd(float temp, uint8_t bat, uint8_t evt) {
     r.temp10 = isnan(temp) ? (int16_t)-9990 : (int16_t)(temp * 10.0f);
     r.bat    = bat;
     r.evt    = evt;
+    if (ntpEpoch == 0 && plogUnsyncedCnt < (int)sizeof(plogUnsynced))
+        plogUnsynced[plogUnsyncedCnt++] = (uint8_t)plogHead;
     plogBuf[plogHead] = r;
     plogHead = (plogHead + 1) % PLOG_MAX;
     if (plogCount < PLOG_MAX) plogCount++;
     plogSave();
+}
+
+// Called once when NTP first syncs — convert this session's relative
+// timestamps to absolute epoch
+void plogFixTimestamps() {
+    if (plogUnsyncedCnt == 0) return;
+    uint32_t nowRel = millis() / 1000;
+    for (int i = 0; i < plogUnsyncedCnt; i++) {
+        PLogRecord& r = plogBuf[plogUnsynced[i]];
+        if (r.ts < 1000000UL && r.ts <= nowRel)
+            r.ts = ntpEpoch - (nowRel - r.ts);
+    }
+    plogUnsyncedCnt = 0;
+    plogSave();
+    Serial.println("[PLOG] Pre-sync timestamps corrected");
 }
 
 int plogGetIdx(int pos) {
@@ -234,8 +271,38 @@ OneWire           oneWire(DHTPIN);
 DallasTemperature ds18(&oneWire);
 AsyncWebServer    server(80);
 WiFiClient        wifiClient;
-WiFiMulti         wifiMulti;
 PubSubClient      mqttClient(wifiClient);
+
+// =====================================================================
+// WiFi Manager — NVS multi-network store + non-blocking connect + AP
+// =====================================================================
+#define WIFI_MAX_NETS 5
+struct WifiNet { char ssid[33]; char pass[65]; };
+WifiNet wifiNets[WIFI_MAX_NETS] = {};
+int     wifiNetCount = 0;
+
+enum WifiMode { WM_OFF, WM_CONNECTING, WM_CONNECTED, WM_LOST };
+WifiMode      wifiMode        = WM_OFF;
+bool          wifiApFallback  = false;  // raise AP if every network fails
+int           wifiTryIdx      = 0;      // attempt counter within one round
+int           wifiCurIdx      = -1;     // index currently being tried
+unsigned long wifiTryStart    = 0;
+unsigned long lastWifiKick    = 0;
+bool          apActive        = false;
+unsigned long apStartMs       = 0;
+int           apPrevClients   = 0;
+DNSServer*    dnsServer       = nullptr;  // captive portal DNS, AP mode only
+unsigned long lastApScanMs    = 0;        // proactive scan while AP is up
+bool          apScanPending   = false;
+unsigned long uiScanUntil     = 0;        // user-initiated scan in progress
+bool          serverStarted   = false;
+bool          mdnsStarted     = false;
+bool          otaBusy         = false;
+bool          fwPending       = false;  // new fw awaiting validation
+bool          mqttEverConnected = false;
+unsigned long lastMqttTryMs   = 0;
+
+RTC_DATA_ATTR int8_t wifiLastGood = -1;  // last successful net — tried first
 
 float         cachedTemp  = NAN;
 float         cachedHum   = NAN;
@@ -487,8 +554,334 @@ bool connectMQTT() {
 }
 
 // =====================================================================
-// Motor Control — TB6612FNG + N20 3V @ 5V supply
-// MAX_PWM=150 caps duty at 60% → ~3V effective (protects motor coils)
+// Settings — NVS-backed; code values above are first-boot defaults only
+// =====================================================================
+void settingsLoad() {
+    prefs.getString("s_wu", www_username, sizeof(www_username));
+    prefs.getString("s_wp", www_password, sizeof(www_password));
+    prefs.getString("s_tk", api_token,    sizeof(api_token));
+    prefs.getString("s_ms", mqtt_server,  sizeof(mqtt_server));
+    prefs.getString("s_mu", mqtt_user,    sizeof(mqtt_user));
+    prefs.getString("s_mk", mqtt_pass,    sizeof(mqtt_pass));
+    mqtt_port = prefs.getInt ("s_mp", mqtt_port);
+    masterKey = prefs.getUInt("s_key", masterKey);
+}
+
+// =====================================================================
+// OTA rollback — DIY 3-strike counter (stock Arduino core lacks the
+// bootloader rollback option). "fw_try" is set to 1 right after an OTA
+// write; each unvalidated boot increments it; 3 failures boot the
+// previous bank. Cleared after 60s healthy uptime or a completed cycle.
+// =====================================================================
+void fwRollbackCheck() {
+    uint8_t tries = prefs.getUChar("fw_try", 0);
+    if (tries == 0) return;
+    if (tries >= 3) {
+        const esp_partition_t* other = esp_ota_get_next_update_partition(NULL);
+        prefs.putUChar("fw_try", 0);
+        if (other && esp_ota_set_boot_partition(other) == ESP_OK) {
+            Serial.println("[OTA] New firmware failed 3 boots — ROLLING BACK");
+            ESP.restart();
+        }
+    } else {
+        prefs.putUChar("fw_try", tries + 1);
+        fwPending = true;
+        Serial.printf("[OTA] Firmware validation boot %u/3\n", tries);
+    }
+}
+
+void fwMarkValid() {
+    if (!fwPending) return;
+    fwPending = false;
+    prefs.putUChar("fw_try", 0);
+    addLog("Firmware validated");
+    Serial.println("[OTA] Firmware marked valid");
+}
+
+// =====================================================================
+// USB detection — this board uses a CH343 USB-UART bridge. When USB
+// power is present the bridge drives UART0 RX (GPIO44) idle-HIGH; with
+// our pulldown enabled it reads LOW when the cable is out. While USB
+// powers the board the battery divider reads the 5V rail, so battery
+// sampling must pause.
+// =====================================================================
+#define UART_RX_GPIO GPIO_NUM_44
+
+bool usbHostPresent() {
+    static unsigned long lastChkMs = 0;
+    static bool          present   = false;
+    if (millis() - lastChkMs >= 1000 || lastChkMs == 0) {
+        lastChkMs = millis();
+        present   = (gpio_get_level(UART_RX_GPIO) == 1);
+    }
+    return present;
+}
+
+// =====================================================================
+// WiFi Manager implementation
+// =====================================================================
+void setupServerRoutes();          // fwd
+void wifiConnectStart(bool apFallback);  // fwd
+
+void wifiSaveNets() {
+    prefs.putBytes("w_nets", wifiNets, sizeof(wifiNets));
+    prefs.putInt("w_n", wifiNetCount);
+}
+
+void wifiLoadNets() {
+    if (prefs.getBytesLength("w_nets") == sizeof(wifiNets)) {
+        prefs.getBytes("w_nets", wifiNets, sizeof(wifiNets));
+        wifiNetCount = constrain(prefs.getInt("w_n", 0), 0, WIFI_MAX_NETS);
+    }
+    if (wifiNetCount == 0) {  // first boot — seed from firmware defaults
+        strlcpy(wifiNets[0].ssid, ssid, sizeof(wifiNets[0].ssid));
+        strlcpy(wifiNets[0].pass, password, sizeof(wifiNets[0].pass));
+        wifiNetCount = 1;
+        wifiSaveNets();
+    }
+    Serial.printf("[WiFi] %d stored network(s)\n", wifiNetCount);
+}
+
+bool wifiAddNet(const char* s, const char* p) {
+    if (!s || !*s) return false;
+    for (int i = 0; i < wifiNetCount; i++)
+        if (!strcmp(wifiNets[i].ssid, s)) {
+            strlcpy(wifiNets[i].pass, p, sizeof(wifiNets[i].pass));
+            wifiSaveNets(); return true;
+        }
+    if (wifiNetCount >= WIFI_MAX_NETS) return false;
+    strlcpy(wifiNets[wifiNetCount].ssid, s, sizeof(wifiNets[0].ssid));
+    strlcpy(wifiNets[wifiNetCount].pass, p, sizeof(wifiNets[0].pass));
+    wifiNetCount++;
+    wifiSaveNets();
+    return true;
+}
+
+bool wifiDelNet(const char* s) {
+    for (int i = 0; i < wifiNetCount; i++)
+        if (!strcmp(wifiNets[i].ssid, s)) {
+            for (int j = i; j < wifiNetCount - 1; j++) wifiNets[j] = wifiNets[j + 1];
+            memset(&wifiNets[--wifiNetCount], 0, sizeof(WifiNet));
+            if (wifiLastGood == i) wifiLastGood = -1;
+            wifiSaveNets(); return true;
+        }
+    return false;
+}
+
+void ensureServerStarted() {
+    if (serverStarted) return;
+    setupServerRoutes();
+    server.begin();
+    serverStarted = true;
+    Serial.println("[WEB] Server started");
+}
+
+void startAP() {
+    if (apActive) return;
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAP(AP_SSID);      // open network for setup
+    apActive      = true;
+    apStartMs     = millis();
+    apPrevClients = 0;
+    if (!mdnsStarted) { MDNS.begin("sbs"); mdnsStarted = true; }
+    ensureServerStarted();
+    // Captive portal — any DNS lookup resolves to us, phones pop the page
+    if (!dnsServer) {
+        dnsServer = new DNSServer();
+        dnsServer->start(53, "*", WiFi.softAPIP());
+    }
+    addLog("Setup AP started (SBS)");
+    Serial.printf("[WiFi] AP \"%s\" up — http://192.168.4.1 / http://sbs.local\n", AP_SSID);
+}
+
+void stopAP() {
+    if (!apActive) return;
+    if (dnsServer) { dnsServer->stop(); delete dnsServer; dnsServer = nullptr; }
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_STA);
+    apActive = false;
+    addLog("Setup AP stopped");
+    Serial.println("[WiFi] AP stopped");
+    // Resume searching for known networks right away
+    if (wifiMode != WM_CONNECTED && wifiMode != WM_CONNECTING)
+        wifiConnectStart(false);
+}
+
+void wifiStartAttempt() {
+    wifiCurIdx = (wifiLastGood >= 0 && wifiLastGood < wifiNetCount)
+                 ? (wifiLastGood + wifiTryIdx) % wifiNetCount
+                 : wifiTryIdx;
+    Serial.printf("[WiFi] Trying \"%s\" (%d/%d)\n",
+                  wifiNets[wifiCurIdx].ssid, wifiTryIdx + 1, wifiNetCount);
+    WiFi.begin(wifiNets[wifiCurIdx].ssid, wifiNets[wifiCurIdx].pass);
+    wifiTryStart = millis();
+}
+
+void wifiConnectStart(bool apFallback) {
+    if (wifiNetCount == 0) { if (apFallback) startAP(); return; }
+    WiFi.mode(apActive ? WIFI_AP_STA : WIFI_STA);
+    wifiApFallback = apFallback;
+    wifiTryIdx     = 0;
+    wifiMode       = WM_CONNECTING;
+    wifiStartAttempt();
+}
+
+// Blocking variant — used only on timer wake (headless report cycle)
+bool wifiConnectBlocking(uint32_t totalTimeoutMs) {
+    WiFi.mode(WIFI_STA);
+    unsigned long start = millis();
+    for (int i = 0; i < wifiNetCount && millis() - start < totalTimeoutMs; i++) {
+        int idx = (wifiLastGood >= 0 && wifiLastGood < wifiNetCount)
+                  ? (wifiLastGood + i) % wifiNetCount : i;
+        WiFi.begin(wifiNets[idx].ssid, wifiNets[idx].pass);
+        unsigned long t0 = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - t0 < WIFI_TRY_MS &&
+               millis() - start < totalTimeoutMs) delay(100);
+        if (WiFi.status() == WL_CONNECTED) { wifiLastGood = idx; return true; }
+        WiFi.disconnect(false, false);
+    }
+    return false;
+}
+
+void onWifiConnected() {
+    wifiMode     = WM_CONNECTED;
+    wifiLastGood = wifiCurIdx;
+    Serial.printf("[WiFi] Connected: \"%s\"  IP %s\n",
+                  WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+    if (!mdnsStarted) { MDNS.begin("sbs"); mdnsStarted = true; }
+    configTime(2 * 3600, 3600, "pool.ntp.org", "time.cloudflare.com");
+    mqttClient.setServer(mqtt_server, mqtt_port);
+    mqttClient.setBufferSize(512);
+    mqttClient.setSocketTimeout(2);
+    lastMqttTryMs = 0;               // connect on next netTick
+    ensureServerStarted();
+    if (apActive) stopAP();          // configured net reached — AP no longer needed
+    char buf[52];
+    snprintf(buf, sizeof(buf), "WiFi: %s", WiFi.localIP().toString().c_str());
+    addLog(buf);
+}
+
+// Non-blocking connection FSM — called every loop
+void wifiTick() {
+    if (wifiMode == WM_CONNECTING) {
+        if (WiFi.status() == WL_CONNECTED) { onWifiConnected(); return; }
+        if (millis() - wifiTryStart >= WIFI_TRY_MS) {
+            WiFi.disconnect(false, false);
+            wifiTryIdx++;
+            if (wifiTryIdx >= wifiNetCount) {
+                Serial.println("[WiFi] All stored networks failed");
+                wifiMode     = WM_LOST;
+                lastWifiKick = millis();
+                if (wifiApFallback && !apActive) startAP();
+            } else {
+                wifiStartAttempt();
+            }
+        }
+    } else if (wifiMode == WM_CONNECTED) {
+        if (WiFi.status() != WL_CONNECTED) {
+            Serial.println("[WiFi] Link lost");
+            wifiMode     = WM_LOST;
+            lastWifiKick = millis();
+        }
+    } else if (wifiMode == WM_LOST) {
+        // While the AP is up, apScanTick() reconnects via a gentle scan
+        // instead of blind connect rounds that would kick AP clients off
+        if (!apActive && millis() - lastWifiKick >= WIFI_RETRY_MS)
+            wifiConnectStart(false);
+    }
+}
+
+// Proactive scan while in AP mode: if a stored network reappears,
+// connect to it even when a client is attached to the AP. Scan-first is
+// gentler on AP clients than repeated WiFi.begin() rounds.
+void apScanTick() {
+    if (!apActive || wifiMode == WM_CONNECTING || wifiMode == WM_CONNECTED) return;
+    if (millis() < uiScanUntil) return;   // don't fight a user-initiated scan
+    if (!apScanPending) {
+        if (millis() - lastApScanMs >= 25000) {
+            lastApScanMs = millis();
+            WiFi.scanNetworks(true);      // async — AP stays up (AP_STA)
+            apScanPending = true;
+        }
+        return;
+    }
+    int n = WiFi.scanComplete();
+    if (n == WIFI_SCAN_RUNNING) return;
+    apScanPending = false;
+    if (n <= 0) { WiFi.scanDelete(); return; }
+    int best = -1, bestRssi = -999;
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < wifiNetCount; j++)
+            if (WiFi.SSID(i) == wifiNets[j].ssid && WiFi.RSSI(i) > bestRssi) {
+                best = j; bestRssi = WiFi.RSSI(i);
+            }
+    WiFi.scanDelete();
+    if (best >= 0) {
+        Serial.printf("[WiFi] Stored net \"%s\" visible (%d dBm) — connecting\n",
+                      wifiNets[best].ssid, bestRssi);
+        wifiLastGood = best;              // round starts with this network
+        wifiConnectStart(false);
+    }
+}
+
+// NTP + MQTT — non-blocking, only when STA link is up
+void netTick() {
+    if (wifiMode != WM_CONNECTED) return;
+
+    if (ntpEpoch == 0) {
+        static unsigned long lastNtpChk = 0;
+        if (millis() - lastNtpChk >= 500) {
+            lastNtpChk = millis();
+            time_t now = 0; time(&now);
+            if (now > 1000000L) {
+                ntpEpoch  = (uint32_t)now;
+                ntpMillis = millis();
+                Serial.printf("[NTP] Synced: %lu\n", (unsigned long)now);
+                plogFixTimestamps();
+            }
+        }
+    }
+
+    if (!mqttClient.connected()) {
+        if (lastMqttTryMs == 0 || millis() - lastMqttTryMs >= MQTT_RETRY_MS) {
+            lastMqttTryMs = millis();
+            if (mqttClient.connect(mqtt_clientid, mqtt_user, mqtt_pass)) {
+                Serial.println("[MQTT] Connected");
+                if (!mqttEverConnected) { mqttPublishDiscovery(); mqttEverConnected = true; }
+                mqttFlushBuffer();
+                mqttPublishState(cachedTemp, cachedHum,
+                                 batPctAvg >= 0 ? batPctAvg : getBatteryPct(),
+                                 currentState != LOCK_OPEN);
+            } else {
+                Serial.printf("[MQTT] Connect failed rc=%d\n", mqttClient.state());
+            }
+        }
+    } else {
+        mqttClient.loop();
+    }
+}
+
+// AP lifetime — close after 2 min with no client; keep alive while in use.
+// When a client disconnects, immediately retry the stored networks (the
+// user has likely just configured one).
+void apTick() {
+    if (!apActive) return;
+    if (dnsServer) dnsServer->processNextRequest();
+    int clients = WiFi.softAPgetStationNum();
+    if (clients > 0) {
+        apStartMs     = millis();   // client present — hold AP open
+        activityTimer = millis();   // and block deep sleep
+    } else if (apPrevClients > 0) {
+        Serial.println("[WiFi] AP client left — retrying stored networks");
+        if (wifiMode != WM_CONNECTED && wifiMode != WM_CONNECTING)
+            wifiConnectStart(false);
+    } else if (millis() - apStartMs >= AP_TIMEOUT_MS) {
+        Serial.println("[WiFi] AP timeout — no client joined");
+        stopAP();
+    }
+    apPrevClients = clients;
+}
+
 // =====================================================================
 // Servo Control — angular servo on SERVO_PIN (GPIO 8)
 // A = 0 deg, B = 180 deg. motorDirSwapped: true -> A(0)=lock, B(180)=unlock
@@ -517,90 +910,100 @@ const char HTML_PAGE[] PROGMEM = R"rawliteral(
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
 <title>SmartSafe Pro</title>
 <style>
-:root{--bg:#0a0a14;--s1:#13131f;--s2:#1a1a2e;--bd:#2a2a45;--ac:#6366f1;--ag:rgba(99,102,241,.3);--gr:#10b981;--rd:#ef4444;--yw:#f59e0b;--tx:#e2e8f0;--tm:#64748b}
+:root{--bg:#0a0a12;--s1:#12121e;--s2:#1a1a2c;--bd:#272740;--bd2:#3b3b64;--ac:#6366f1;--ac2:#8b5cf6;--ag:rgba(99,102,241,.3);--gr:#10b981;--rd:#ef4444;--yw:#f59e0b;--tx:#e8ecf4;--tm:#6b7490}
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--tx);min-height:100vh;padding:16px;max-width:480px;margin:0 auto}
-.hdr{display:flex;align-items:center;justify-content:space-between;padding:14px 0 20px;border-bottom:1px solid var(--bd);margin-bottom:18px}
-.hdr h1{font-size:1.25rem;font-weight:700;letter-spacing:-.02em}
-.hdr .sub{color:var(--tm);font-size:.7rem;margin-top:2px}
-.badge{display:inline-flex;align-items:center;gap:5px;padding:4px 11px;border-radius:20px;font-size:.72rem;font-weight:600;background:rgba(16,185,129,.12);color:var(--gr);border:1px solid rgba(16,185,129,.25)}
-.g2{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px}
-.card{background:var(--s1);border:1px solid var(--bd);border-radius:12px;padding:14px;transition:border-color .25s}
-.card:hover{border-color:var(--ac)}
-.lbl{color:var(--tm);font-size:.65rem;text-transform:uppercase;letter-spacing:.08em;margin-bottom:7px}
-.val{font-size:1.55rem;font-weight:700;line-height:1}
-.sub2{color:var(--tm);font-size:.72rem;margin-top:4px}
-.lock-card{grid-column:span 2;display:flex;align-items:center;gap:18px}
-.lock-ico{width:62px;height:62px;border-radius:14px;display:flex;align-items:center;justify-content:center;font-size:1.9rem;flex-shrink:0;transition:all .4s}
-.lock-ico.lk{background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.28)}
-.lock-ico.ul{background:rgba(16,185,129,.12);border:1px solid rgba(16,185,129,.28);animation:pg 1s ease-in-out 3}
-@keyframes pg{0%,100%{box-shadow:0 0 0 0 rgba(16,185,129,0)}50%{box-shadow:0 0 0 8px rgba(16,185,129,.2)}}
-.lock-h2{font-size:1.05rem;margin-bottom:3px}
-.lock-p{color:var(--tm);font-size:.78rem}
-.bat-bar{height:7px;background:var(--bd);border-radius:4px;margin-top:7px;overflow:hidden}
+body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:radial-gradient(900px 420px at 50% -10%,#16163a 0%,var(--bg) 62%) fixed;color:var(--tx);min-height:100vh;padding:16px 16px 34px;max-width:480px;margin:0 auto}
+.hdr{display:flex;align-items:center;justify-content:space-between;padding:12px 0 16px;margin-bottom:6px}
+.hdr h1{font-size:1.32rem;font-weight:800;letter-spacing:-.02em;background:linear-gradient(90deg,#fff 30%,#a7aefb);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+.hdr .sub{color:var(--tm);font-size:.68rem;margin-top:3px}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:5px 12px;border-radius:20px;font-size:.7rem;font-weight:600;border:1px solid;font-family:monospace}
+.chip.on{background:rgba(16,185,129,.1);color:var(--gr);border-color:rgba(16,185,129,.3)}
+.chip.apm{background:rgba(245,158,11,.1);color:var(--yw);border-color:rgba(245,158,11,.3)}
+.chip.off{background:rgba(239,68,68,.08);color:var(--rd);border-color:rgba(239,68,68,.25)}
+.chip .dot{width:6px;height:6px;border-radius:50%;background:currentColor;animation:pl 2.2s ease-in-out infinite}
+@keyframes pl{50%{opacity:.35}}
+.hero{background:linear-gradient(165deg,var(--s2),var(--s1) 70%);border:1px solid var(--bd);border-radius:18px;padding:24px 18px 18px;text-align:center;margin-bottom:12px;position:relative;overflow:hidden}
+.hero::before{content:'';position:absolute;left:20%;right:20%;top:-60px;height:120px;background:radial-gradient(60% 100% at 50% 0,rgba(99,102,241,.22),transparent);pointer-events:none}
+.lock-ico{width:78px;height:78px;margin:0 auto 12px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:2.1rem;transition:all .4s;position:relative}
+.lock-ico.lk{background:rgba(239,68,68,.1);border:2px solid rgba(239,68,68,.35);box-shadow:0 0 34px rgba(239,68,68,.14)}
+.lock-ico.ul{background:rgba(16,185,129,.1);border:2px solid rgba(16,185,129,.45);box-shadow:0 0 34px rgba(16,185,129,.3);animation:pg 1s ease-in-out 3}
+@keyframes pg{50%{box-shadow:0 0 52px rgba(16,185,129,.55)}}
+.lock-h2{font-size:1.18rem;font-weight:700;margin-bottom:2px}
+.lock-p{color:var(--tm);font-size:.75rem;margin-bottom:16px}
+.btn-ul{width:100%;padding:14px;background:linear-gradient(135deg,var(--ac),var(--ac2));border:none;border-radius:12px;color:#fff;font-size:.95rem;font-weight:700;cursor:pointer;transition:all .2s;letter-spacing:.02em;box-shadow:0 6px 22px rgba(99,102,241,.28)}
+.btn-ul:hover{transform:translateY(-1px);box-shadow:0 10px 30px rgba(99,102,241,.42)}
+.btn-ul:active{transform:translateY(0)}
+.btn-ul:disabled{opacity:.45;cursor:not-allowed;transform:none;box-shadow:none}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:4px}
+.card{background:var(--s1);border:1px solid var(--bd);border-radius:14px;padding:14px;transition:all .25s}
+.card:hover{border-color:var(--bd2);transform:translateY(-1px)}
+.lbl{color:var(--tm);font-size:.62rem;text-transform:uppercase;letter-spacing:.1em;margin-bottom:8px}
+.val{font-size:1.5rem;font-weight:700;line-height:1;font-variant-numeric:tabular-nums}
+.sub2{color:var(--tm);font-size:.7rem;margin-top:5px}
+.bat-span{grid-column:span 2}
+.bat-bar{height:8px;background:var(--bd);border-radius:4px;margin-top:9px;overflow:hidden}
 .bat-fill{height:100%;border-radius:4px;transition:width .5s}
-.bat-fill.hi{background:var(--gr)}.bat-fill.md{background:var(--yw)}.bat-fill.lo{background:var(--rd)}
+.bat-fill.hi{background:linear-gradient(90deg,#0b9e6b,var(--gr))}.bat-fill.md{background:linear-gradient(90deg,#d18708,var(--yw))}.bat-fill.lo{background:var(--rd)}
 .wifi{display:flex;align-items:flex-end;gap:3px;height:22px;margin-bottom:4px}
 .wifi span{width:5px;background:var(--bd);border-radius:2px;transition:background .3s}
 .wifi span:nth-child(1){height:6px}.wifi span:nth-child(2){height:11px}.wifi span:nth-child(3){height:16px}.wifi span:nth-child(4){height:21px}
 .wifi.gd span{background:var(--gr)}.wifi.md span:not(:nth-child(4)){background:var(--yw)}.wifi.wk span:first-child{background:var(--rd)}
-.bat-span{grid-column:span 2}
-.btn-ul{width:100%;padding:15px;background:linear-gradient(135deg,#6366f1,#8b5cf6);border:none;border-radius:12px;color:#fff;font-size:.98rem;font-weight:700;cursor:pointer;transition:all .2s;margin-bottom:10px;letter-spacing:.02em}
-.btn-ul:hover{transform:translateY(-1px);box-shadow:0 8px 25px var(--ag)}
-.btn-ul:active{transform:translateY(0)}
-.btn-ul:disabled{opacity:.45;cursor:not-allowed;transform:none}
-.nav{display:flex;gap:8px;margin-bottom:14px}
-.nav a{flex:1;text-align:center;padding:9px 4px;background:var(--s1);border:1px solid var(--bd);border-radius:10px;color:var(--tm);font-size:.73rem;text-decoration:none;transition:border-color .2s}
-.nav a:hover{border-color:var(--ac);color:var(--tx)}
-.sec{font-size:.68rem;text-transform:uppercase;letter-spacing:.1em;color:var(--tm);margin:18px 0 7px}
-.lst{background:var(--s1);border:1px solid var(--bd);border-radius:12px;overflow:hidden}
+.nav{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:12px 0 2px}
+.nav a{text-align:center;padding:11px 2px 9px;background:var(--s1);border:1px solid var(--bd);border-radius:12px;color:var(--tm);font-size:.6rem;font-weight:600;text-decoration:none;transition:all .2s;display:flex;flex-direction:column;align-items:center;gap:4px}
+.nav a .ic{font-size:1.05rem;line-height:1}
+.nav a:hover{border-color:var(--ac);color:var(--tx);transform:translateY(-1px)}
+.sec{font-size:.65rem;text-transform:uppercase;letter-spacing:.12em;color:var(--tm);margin:18px 0 7px;display:flex;align-items:center;gap:8px}
+.sec::after{content:'';flex:1;height:1px;background:var(--bd)}
+.lst{background:var(--s1);border:1px solid var(--bd);border-radius:14px;overflow:hidden}
 .li{display:flex;align-items:center;justify-content:space-between;padding:11px 14px;border-bottom:1px solid var(--bd);font-size:.83rem}
 .li:last-child{border-bottom:none}
 .li .id{color:var(--tm);font-family:monospace;font-size:.72rem}
 .btn-del{background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.28);color:var(--rd);padding:4px 10px;border-radius:6px;font-size:.72rem;cursor:pointer;transition:all .2s}
 .btn-del:hover{background:rgba(239,68,68,.2)}
-.log-it{padding:9px 14px;border-bottom:1px solid var(--bd);font-size:.78rem}
+.log-it{padding:9px 14px;border-bottom:1px solid var(--bd);font-size:.78rem;display:flex;gap:10px;align-items:baseline}
 .log-it:last-child{border-bottom:none}
-.log-t{color:var(--tm);font-family:monospace;font-size:.68rem;margin-bottom:2px}
+.log-t{color:var(--tm);font-family:monospace;font-size:.66rem;white-space:nowrap}
 .log-it.ok .log-m{color:var(--gr)}.log-it.er .log-m{color:var(--rd)}.log-it.in .log-m{color:var(--tx)}
 .spin{display:inline-block;width:13px;height:13px;border:2px solid var(--bd);border-top-color:var(--ac);border-radius:50%;animation:sp .8s linear infinite}
 @keyframes sp{to{transform:rotate(360deg)}}
 .empty{padding:22px;text-align:center;color:var(--tm);font-size:.82rem}
-.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%) translateY(80px);background:var(--s2);border:1px solid var(--bd);padding:11px 22px;border-radius:8px;font-size:.82rem;transition:transform .3s;z-index:99;white-space:nowrap}
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%) translateY(80px);background:var(--s2);border:1px solid var(--bd);padding:11px 22px;border-radius:10px;font-size:.82rem;transition:transform .3s;z-index:99;white-space:nowrap;box-shadow:0 10px 30px rgba(0,0,0,.45)}
 .toast.sh{transform:translateX(-50%) translateY(0)}
 .toast.ok{border-color:var(--gr);color:var(--gr)}.toast.er{border-color:var(--rd);color:var(--rd)}
 </style>
 </head>
 <body>
 <div class="hdr">
-  <div><h1>&#128274; SmartSafe Pro</h1><div class="sub" id="uptime">Loading...</div></div>
-  <div class="badge">&#9679; Connected</div>
+  <div><h1>SmartSafe Pro</h1><div class="sub" id="uptime">Loading...</div></div>
+  <div class="chip off" id="netChip"><span class="dot"></span><span id="netTxt">...</span></div>
+</div>
+<div class="hero">
+  <div class="lock-ico lk" id="lIco">&#128274;</div>
+  <div class="lock-h2" id="lStat">Locked</div>
+  <div class="lock-p" id="lSub">State: Idle</div>
+  <button class="btn-ul" id="ulBtn" onclick="doUnlock()">&#128275; Unlock Door</button>
 </div>
 <div class="g2">
-  <div class="card lock-card">
-    <div class="lock-ico lk" id="lIco">&#128274;</div>
-    <div><div class="lock-h2" id="lStat">Locked</div><div class="lock-p" id="lSub">State: Idle</div></div>
-  </div>
-</div>
-<div class="g2">
-  <div class="card"><div class="lbl">Temperature</div><div class="val" id="tVal">--</div><div class="sub2">&#176;C</div></div>
+  <div class="card"><div class="lbl">&#127777; Temperature</div><div class="val" id="tVal">--</div><div class="sub2">&#176;C</div></div>
   <div class="card">
-    <div class="lbl">WiFi</div>
+    <div class="lbl">&#128246; WiFi</div>
     <div class="wifi gd" id="wBars"><span></span><span></span><span></span><span></span></div>
     <div class="sub2" id="wRssi">-- dBm</div>
   </div>
   <div class="card bat-span">
-    <div class="lbl">Battery</div>
+    <div class="lbl">&#128267; Battery</div>
     <div class="val" id="bVal">--%</div>
     <div class="bat-bar"><div class="bat-fill hi" id="bBar" style="width:0%"></div></div>
     <div id="bDbg" style="font-family:monospace;font-size:.62rem;color:var(--yw);margin-top:5px;line-height:1.5">raw: --<br>-- V</div>
   </div>
 </div>
-<button class="btn-ul" id="ulBtn" onclick="doUnlock()">&#128275; Unlock Door</button>
 <div class="nav">
-  <a href="/monitor">&#128270; Monitor</a>
-  <a href="/graph">&#128200; History</a>
-  <a href="/calib">&#9881; Calibration</a>
+  <a href="/monitor"><span class="ic">&#128270;</span>Monitor</a>
+  <a href="/graph"><span class="ic">&#128200;</span>History</a>
+  <a href="/calib"><span class="ic">&#128295;</span>Calib</a>
+  <a href="/wifi"><span class="ic">&#128246;</span>WiFi</a>
+  <a href="/update"><span class="ic">&#11014;</span>OTA</a>
+  <a href="/settings"><span class="ic">&#9881;</span>Settings</a>
 </div>
 <div class="sec">Authorized Cards</div>
 <div class="lst" id="cList"><div class="empty"><span class="spin"></span></div></div>
@@ -608,7 +1011,7 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(
 <div class="lst" id="lList"><div class="empty"><span class="spin"></span></div></div>
 <div class="toast" id="toast"></div>
 <script>
-const TK='Your_API_Token';let cd=false;
+let cd=false;
 function toast(m,t='in'){const el=document.getElementById('toast');el.textContent=m;el.className='toast sh '+t;setTimeout(()=>el.classList.remove('sh'),3200);}
 async function fetchSt(){
   try{
@@ -624,12 +1027,17 @@ async function fetchSt(){
     document.getElementById('bVal').textContent=b+'%';
     const bf=document.getElementById('bBar');bf.style.width=b+'%';
     bf.className='bat-fill '+(b>50?'hi':b>20?'md':'lo');
-    if(d.bat_raw!==undefined)document.getElementById('bDbg').innerHTML='raw: '+d.bat_raw+'<br>'+parseFloat(d.bat_v).toFixed(3)+' V';
+    if(d.usb)document.getElementById('bDbg').innerHTML='&#9889; USB powered &#8212; battery reading paused';
+    else if(d.bat_raw!==undefined)document.getElementById('bDbg').innerHTML='raw: '+d.bat_raw+'<br>'+parseFloat(d.bat_v).toFixed(3)+' V';
     document.getElementById('wRssi').textContent=d.rssi+' dBm';
     const wb=document.getElementById('wBars');
     wb.className='wifi '+(d.rssi>-60?'gd':d.rssi>-75?'md':'wk');
     const s=d.uptime,h=Math.floor(s/3600),m=Math.floor((s%3600)/60);
-    document.getElementById('uptime').textContent='Uptime: '+(h?h+'h ':'')+m+'m';
+    document.getElementById('uptime').textContent='Uptime: '+(h?h+'h ':'')+m+'m · v'+(d.fw||'?');
+    const nc=document.getElementById('netChip'),nt=document.getElementById('netTxt');
+    if(d.net==='sta'){nc.className='chip on';nt.textContent=d.ip;}
+    else if(d.net==='ap'){nc.className='chip apm';nt.textContent='AP · SBS';}
+    else{nc.className='chip off';nt.textContent='Offline';}
   }catch(e){}
 }
 async function fetchCards(){
@@ -655,7 +1063,7 @@ async function fetchLog(){
 async function doUnlock(){
   if(cd)return;const btn=document.getElementById('ulBtn');btn.disabled=true;cd=true;
   try{
-    const r=await fetch('/open?t='+TK);
+    const r=await fetch('/open');
     if(r.ok){toast('Door unlocked!','ok');setTimeout(()=>{fetchSt();fetchLog();},600);}
     else if(r.status===429)toast('Cooldown active...','er');
     else toast('Unlock failed','er');
@@ -1065,6 +1473,291 @@ async function save(){
 )rawliteral";
 
 // =====================================================================
+// HTML — WiFi Settings
+// =====================================================================
+const char WIFI_PAGE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>WiFi &#8212; SmartSafe</title>
+<style>
+:root{--bg:#0a0a14;--s1:#13131f;--bd:#2a2a45;--ac:#6366f1;--gr:#10b981;--rd:#ef4444;--yw:#f59e0b;--tx:#e2e8f0;--tm:#64748b}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--tx);min-height:100vh;padding:16px;max-width:440px;margin:0 auto}
+.hdr{display:flex;align-items:center;justify-content:space-between;padding:14px 0 20px;border-bottom:1px solid var(--bd);margin-bottom:16px}
+.hdr h1{font-size:1.15rem;font-weight:700}
+.back{color:var(--ac);font-size:.78rem;text-decoration:none;padding:5px 11px;border:1px solid var(--bd);border-radius:8px}
+.sec{font-size:.62rem;text-transform:uppercase;letter-spacing:.1em;color:var(--tm);margin:16px 0 6px}
+.card{background:var(--s1);border:1px solid var(--bd);border-radius:12px;padding:14px;margin-bottom:8px}
+.row{display:flex;justify-content:space-between;align-items:center;padding:9px 0;border-bottom:1px solid rgba(42,42,69,.6);font-size:.83rem}
+.row:last-child{border-bottom:none}
+.mono{font-family:monospace;color:var(--tm);font-size:.72rem}
+.rssi{font-size:.68rem;color:var(--tm);min-width:56px;text-align:right}
+.btn-del{background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.28);color:var(--rd);padding:4px 10px;border-radius:6px;font-size:.72rem;cursor:pointer}
+.btn-add{background:rgba(16,185,129,.1);border:1px solid rgba(16,185,129,.28);color:var(--gr);padding:4px 10px;border-radius:6px;font-size:.72rem;cursor:pointer}
+.bscan{width:100%;padding:13px;background:linear-gradient(135deg,#6366f1,#8b5cf6);border:none;border-radius:12px;color:#fff;font-size:.92rem;font-weight:700;cursor:pointer}
+.bscan:disabled{opacity:.4;cursor:not-allowed}
+.empty{padding:18px;text-align:center;color:var(--tm);font-size:.8rem}
+.chip{display:inline-flex;padding:3px 10px;border-radius:20px;font-size:.7rem;font-weight:600}
+.chip-ok{background:rgba(16,185,129,.12);color:var(--gr);border:1px solid rgba(16,185,129,.3)}
+.chip-off{background:rgba(100,116,139,.12);color:var(--tm);border:1px solid rgba(100,116,139,.3)}
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%) translateY(80px);background:#1a1a2e;border:1px solid var(--bd);padding:11px 22px;border-radius:8px;font-size:.82rem;transition:transform .3s;z-index:99;white-space:nowrap}
+.toast.sh{transform:translateX(-50%) translateY(0)}
+.toast.ok{border-color:var(--gr);color:var(--gr)}.toast.er{border-color:var(--rd);color:var(--rd)}
+.spin{display:inline-block;width:13px;height:13px;border:2px solid var(--bd);border-top-color:var(--ac);border-radius:50%;animation:sp .8s linear infinite;vertical-align:-2px}
+@keyframes sp{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<div class="hdr">
+  <div><h1>&#128246; WiFi Settings</h1></div>
+  <a href="/" class="back">&#8592; Dashboard</a>
+</div>
+<div class="sec">Connection</div>
+<div class="card" id="stCard"><div class="empty"><span class="spin"></span></div></div>
+<div class="sec">Saved Networks (max 5)</div>
+<div class="card" id="savedCard"><div class="empty">Loading...</div></div>
+<div class="sec">Add a Network</div>
+<button class="bscan" id="scanBtn" onclick="doScan()">&#128269; Scan for Networks</button>
+<div class="card" id="scanCard" style="margin-top:8px"><div class="empty">Press Scan to search</div></div>
+<div class="toast" id="toast"></div>
+<script>
+function toast(m,t){const el=document.getElementById('toast');el.textContent=m;el.className='toast sh '+(t||'');setTimeout(()=>el.classList.remove('sh'),3200);}
+async function api(p){const r=await fetch(p);if(!r.ok)throw new Error(r.status);return r.json();}
+async function loadStatus(){
+  try{
+    const d=await api('/api/wifi/status');
+    let h='';
+    if(d.mode==='sta'){
+      h=`<div class="row"><span>Status</span><span class="chip chip-ok">Connected</span></div>
+         <div class="row"><span>Network</span><span class="mono">${d.ssid}</span></div>
+         <div class="row"><span>IP</span><span class="mono">${d.ip}</span></div>
+         <div class="row"><span>Signal</span><span class="mono">${d.rssi} dBm</span></div>`;
+    }else if(d.mode==='connecting'){
+      h=`<div class="row"><span>Status</span><span class="chip chip-off"><span class="spin"></span>&nbsp;Connecting...</span></div>`;
+    }else{
+      h=`<div class="row"><span>Status</span><span class="chip chip-off">Not connected</span></div>`;
+    }
+    if(d.ap)h+=`<div class="row"><span>Setup AP</span><span class="chip chip-ok">SBS active · ${d.ap_clients} client(s)</span></div>`;
+    document.getElementById('stCard').innerHTML=h;
+    const sc=document.getElementById('savedCard');
+    if(!d.nets.length)sc.innerHTML='<div class="empty">No saved networks</div>';
+    else sc.innerHTML=d.nets.map(n=>`<div class="row"><span>${n}${d.mode==='sta'&&n===d.ssid?' <span class="chip chip-ok">&#10003;</span>':''}</span><button class="btn-del" onclick="delNet('${n.replace(/'/g,"\\'")}')">Remove</button></div>`).join('');
+  }catch(e){}
+}
+async function delNet(s){
+  if(!confirm('Remove network "'+s+'"?'))return;
+  try{const d=await api('/api/wifi/del?ssid='+encodeURIComponent(s));
+    if(d.ok){toast('Network removed','ok');loadStatus();}else toast('Failed','er');
+  }catch(e){toast('Error','er');}
+}
+let scanning=false;
+async function doScan(){
+  if(scanning)return;scanning=true;
+  const btn=document.getElementById('scanBtn'),card=document.getElementById('scanCard');
+  btn.disabled=true;card.innerHTML='<div class="empty"><span class="spin"></span> Scanning...</div>';
+  try{
+    await api('/api/wifi/scan?start=1');
+    for(let i=0;i<20;i++){
+      await new Promise(r=>setTimeout(r,700));
+      const d=await api('/api/wifi/scan');
+      if(d.running)continue;
+      if(!d.nets||!d.nets.length){card.innerHTML='<div class="empty">No networks found</div>';break;}
+      card.innerHTML=d.nets.map(n=>`<div class="row"><span>${n.sec?'&#128274; ':''}${n.ssid}</span><span style="display:flex;gap:8px;align-items:center"><span class="rssi">${n.rssi} dBm</span><button class="btn-add" onclick="addNet('${n.ssid.replace(/'/g,"\\'")}',${n.sec})">Add</button></span></div>`).join('');
+      break;
+    }
+  }catch(e){card.innerHTML='<div class="empty">Scan failed</div>';}
+  btn.disabled=false;scanning=false;
+}
+async function addNet(s,sec){
+  let p='';
+  if(sec){p=prompt('Password for "'+s+'":');if(p===null)return;}
+  try{
+    const d=await api('/api/wifi/add?ssid='+encodeURIComponent(s)+'&pass='+encodeURIComponent(p));
+    if(d.ok){toast('Saved — connecting...','ok');setTimeout(loadStatus,1500);}
+    else toast(d.err||'Failed (5 max?)','er');
+  }catch(e){toast('Error','er');}
+}
+loadStatus();setInterval(loadStatus,4000);
+</script>
+</body>
+</html>
+)rawliteral";
+
+// =====================================================================
+// HTML — OTA Update
+// =====================================================================
+const char OTA_PAGE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>OTA Update &#8212; SmartSafe</title>
+<style>
+:root{--bg:#0a0a14;--s1:#13131f;--bd:#2a2a45;--ac:#6366f1;--gr:#10b981;--rd:#ef4444;--yw:#f59e0b;--tx:#e2e8f0;--tm:#64748b}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--tx);min-height:100vh;padding:16px;max-width:480px;margin:0 auto}
+.hdr{display:flex;align-items:center;justify-content:space-between;padding:14px 0 20px;border-bottom:1px solid var(--bd);margin-bottom:24px}
+.hdr h1{font-size:1.15rem;font-weight:700}.hdr .sub{color:var(--tm);font-size:.68rem;margin-top:2px}
+.back{color:var(--ac);font-size:.78rem;text-decoration:none;padding:5px 11px;border:1px solid var(--bd);border-radius:8px}
+.card{background:var(--s1);border:1px solid var(--bd);border-radius:12px;padding:20px;margin-bottom:16px}
+.card h2{font-size:.85rem;font-weight:600;margin-bottom:14px}
+.card p{font-size:.76rem;color:var(--tm);margin-bottom:14px;line-height:1.5}
+.drop{border:2px dashed var(--bd);border-radius:10px;padding:30px;text-align:center;cursor:pointer;transition:border .2s}
+.drop:hover,.drop.over{border-color:var(--ac)}
+.drop input{display:none}
+.drop-lbl{font-size:.8rem;color:var(--tm)}
+.drop-name{font-size:.8rem;color:var(--ac);margin-top:6px;font-weight:600}
+.btn{width:100%;margin-top:14px;background:var(--ac);color:#fff;border:none;border-radius:8px;padding:11px;font-size:.85rem;font-weight:600;cursor:pointer}
+.btn:disabled{opacity:.4;cursor:default}
+.prog{margin-top:14px;display:none}
+.prog-bar{height:6px;background:var(--bd);border-radius:3px;overflow:hidden}
+.prog-fill{height:100%;width:0;background:var(--ac);transition:width .3s}
+.prog-txt{font-size:.72rem;color:var(--tm);margin-top:6px;text-align:center}
+.msg{margin-top:12px;font-size:.8rem;text-align:center;padding:8px;border-radius:8px;display:none}
+.msg.ok{background:rgba(16,185,129,.12);color:var(--gr);border:1px solid rgba(16,185,129,.3)}
+.msg.er{background:rgba(239,68,68,.1);color:var(--rd);border:1px solid rgba(239,68,68,.3)}
+.warn{background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.3);border-radius:8px;padding:10px 12px;font-size:.74rem;color:var(--yw);margin-bottom:16px}
+</style>
+</head>
+<body>
+<div class="hdr">
+  <div><h1>&#11014; OTA Update</h1><div class="sub" id="fwEl">Current firmware: ...</div></div>
+  <a class="back" href="/">&#8592; Back</a>
+</div>
+<div class="warn">&#9888; The device reboots after a successful upload. Make sure the door is locked first.</div>
+<div class="card">
+  <h2>Upload Firmware (.bin)</h2>
+  <p>PlatformIO output: <code style="color:var(--ac)">.pio/build/esp32s3/firmware.bin</code></p>
+  <div class="drop" id="drop" onclick="document.getElementById('file').click()" ondragover="event.preventDefault();this.classList.add('over')" ondragleave="this.classList.remove('over')" ondrop="onDrop(event)">
+    <input type="file" id="file" accept=".bin" onchange="onFile(this.files[0])">
+    <div class="drop-lbl">&#128194; Click or drop .bin file here</div>
+    <div class="drop-name" id="fname"></div>
+  </div>
+  <button class="btn" id="btn" disabled onclick="doUpload()">Upload &amp; Update</button>
+  <div class="prog" id="prog"><div class="prog-bar"><div class="prog-fill" id="fill"></div></div><div class="prog-txt" id="ptxt">0%</div></div>
+  <div class="msg" id="msg"></div>
+</div>
+<script>
+let file=null;
+fetch('/api/status').then(r=>r.json()).then(d=>{document.getElementById('fwEl').textContent='Current firmware: v'+(d.fw||'?');}).catch(()=>{});
+function onDrop(e){e.preventDefault();document.getElementById('drop').classList.remove('over');onFile(e.dataTransfer.files[0]);}
+function onFile(f){if(!f||!f.name.endsWith('.bin'))return;file=f;document.getElementById('fname').textContent=f.name+' ('+Math.round(f.size/1024)+' KB)';document.getElementById('btn').disabled=false;}
+function showMsg(txt,ok){const m=document.getElementById('msg');m.textContent=txt;m.className='msg '+(ok?'ok':'er');m.style.display='block';}
+function doUpload(){
+  if(!file)return;
+  const btn=document.getElementById('btn');btn.disabled=true;
+  const fd=new FormData();fd.append('firmware',file,file.name);
+  const xhr=new XMLHttpRequest();
+  xhr.open('POST','/update');
+  xhr.upload.onprogress=e=>{if(e.lengthComputable){const p=Math.round(e.loaded/e.total*100);document.getElementById('fill').style.width=p+'%';document.getElementById('ptxt').textContent=p+'%';}};
+  document.getElementById('prog').style.display='block';
+  xhr.onload=()=>{if(xhr.status===200&&xhr.responseText.startsWith('OK')){showMsg('Success! Rebooting... reconnect in ~5s.',true);}else{showMsg('Failed: '+xhr.responseText,false);btn.disabled=false;}};
+  xhr.onerror=()=>{showMsg('Connection error',false);btn.disabled=false;};
+  xhr.send(fd);
+}
+</script>
+</body>
+</html>
+)rawliteral";
+
+// =====================================================================
+// HTML — Settings
+// =====================================================================
+const char SETTINGS_PAGE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>Settings &#8212; SmartSafe</title>
+<style>
+:root{--bg:#0a0a12;--s1:#12121e;--bd:#272740;--ac:#6366f1;--ac2:#8b5cf6;--gr:#10b981;--rd:#ef4444;--yw:#f59e0b;--tx:#e8ecf4;--tm:#6b7490}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--tx);min-height:100vh;padding:16px;max-width:440px;margin:0 auto}
+.hdr{display:flex;align-items:center;justify-content:space-between;padding:14px 0 20px;border-bottom:1px solid var(--bd);margin-bottom:16px}
+.hdr h1{font-size:1.15rem;font-weight:700}
+.back{color:var(--ac);font-size:.78rem;text-decoration:none;padding:5px 11px;border:1px solid var(--bd);border-radius:8px}
+.sec{font-size:.62rem;text-transform:uppercase;letter-spacing:.1em;color:var(--tm);margin:16px 0 6px}
+.card{background:var(--s1);border:1px solid var(--bd);border-radius:12px;padding:14px;margin-bottom:8px}
+label{display:block;color:var(--tm);font-size:.65rem;text-transform:uppercase;letter-spacing:.08em;margin:10px 0 5px}
+label:first-child{margin-top:0}
+input{width:100%;padding:10px 12px;background:var(--bg);border:1px solid var(--bd);border-radius:8px;color:var(--tx);font-size:.9rem;font-family:monospace}
+input:focus{outline:none;border-color:var(--ac)}
+input::placeholder{color:#3a3a5c}
+.note{font-size:.68rem;color:var(--tm);margin-top:8px;line-height:1.5}
+.bsave{width:100%;padding:15px;background:linear-gradient(135deg,var(--ac),var(--ac2));border:none;border-radius:12px;color:#fff;font-size:1rem;font-weight:700;cursor:pointer;margin-top:10px}
+.bsave:disabled{opacity:.4}
+.msg{margin-top:10px;padding:10px 12px;border-radius:8px;font-size:.82rem;text-align:center;display:none}
+.msg.ok{background:rgba(16,185,129,.1);color:var(--gr);border:1px solid rgba(16,185,129,.2);display:block}
+.msg.er{background:rgba(239,68,68,.1);color:var(--rd);border:1px solid rgba(239,68,68,.2);display:block}
+.warn{background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.25);border-radius:8px;padding:9px 12px;font-size:.7rem;color:var(--yw);margin-bottom:12px;line-height:1.5}
+</style>
+</head>
+<body>
+<div class="hdr">
+  <div><h1>&#9881; Settings</h1></div>
+  <a href="/" class="back">&#8592; Dashboard</a>
+</div>
+<div class="warn">&#9888; Values are stored on the device (NVS) and survive updates. Leave a password field empty to keep the current one.</div>
+<div class="sec">Web Access</div>
+<div class="card">
+  <label>Username</label><input id="wu" maxlength="23" autocomplete="off">
+  <label>Password</label><input id="wp" type="password" maxlength="31" placeholder="(unchanged)" autocomplete="new-password">
+  <div class="note">Changing these will make the browser ask you to log in again.</div>
+</div>
+<div class="sec">API Token</div>
+<div class="card">
+  <label>Token (for /open?t=... automation)</label><input id="tk" maxlength="32" autocomplete="off">
+</div>
+<div class="sec">MQTT — Home Assistant</div>
+<div class="card">
+  <label>Server</label><input id="ms" maxlength="39" autocomplete="off">
+  <label>Port</label><input id="mp" type="number" min="1" max="65535">
+  <label>Username</label><input id="mu" maxlength="23" autocomplete="off">
+  <label>Password</label><input id="mk" type="password" maxlength="31" placeholder="(unchanged)" autocomplete="new-password">
+</div>
+<div class="sec">RFID</div>
+<div class="card">
+  <label>Master key (card # that toggles edit mode)</label><input id="key" type="number" min="1">
+</div>
+<button class="bsave" id="btnSave" onclick="save()">&#128190; Save Settings</button>
+<div class="msg" id="msg"></div>
+<script>
+async function load(){
+  try{
+    const d=await(await fetch('/api/settings')).json();
+    document.getElementById('wu').value=d.wu;
+    document.getElementById('tk').value=d.tk;
+    document.getElementById('ms').value=d.ms;
+    document.getElementById('mp').value=d.mp;
+    document.getElementById('mu').value=d.mu;
+    document.getElementById('key').value=d.key;
+  }catch(e){}
+}
+async function save(){
+  const btn=document.getElementById('btnSave');btn.disabled=true;
+  const f=id=>encodeURIComponent(document.getElementById(id).value.trim());
+  const q=`wu=${f('wu')}&wp=${f('wp')}&tk=${f('tk')}&ms=${f('ms')}&mp=${f('mp')}&mu=${f('mu')}&mk=${f('mk')}&key=${f('key')}`;
+  const m=document.getElementById('msg');
+  try{
+    const r=await(await fetch('/api/settings/save?'+q)).json();
+    m.className='msg '+(r.ok?'ok':'er');
+    m.textContent=r.ok?'✓ Saved! Settings applied.':'✗ Save failed';
+    document.getElementById('wp').value='';document.getElementById('mk').value='';
+  }catch(e){m.className='msg er';m.textContent='Connection error';}
+  btn.disabled=false;
+}
+load();
+</script>
+</body>
+</html>
+)rawliteral";
+
+// =====================================================================
 // ISR — Wiegand RFID
 // =====================================================================
 void IRAM_ATTR rfid_isr_d0() {
@@ -1230,23 +1923,24 @@ void setupServerRoutes() {
 
     server.on("/open", HTTP_GET, [](AsyncWebServerRequest *req) {
         if (!req->authenticate(www_username, www_password)) return req->requestAuthentication();
-        if (req->hasParam("t") && req->getParam("t")->value() == api_token) {
-            if (millis() - lastUnlockTime > LOCK_COOLDOWN_MS) {
-                setSystemState(LOCK_OPEN);
-                activityTimer = millis();
-                addLog("Opened via web");
-                rtcAddRecord(cachedTemp, cachedHum, getBatteryPct(), 2, 2);
-                if (mqttClient.connected()) {
-                    mqttPublishEvent("web_open");
-                    mqttPublishState(cachedTemp, cachedHum, getBatteryPct(), false);
-                }
-                req->send(200, "text/plain", "OK");
-            } else {
-                req->send(429, "text/plain", "Cooldown");
-            }
-        } else {
+        // Token optional (basic-auth already guards); if present it must match
+        if (req->hasParam("t") && req->getParam("t")->value() != api_token) {
             addLog("Invalid token attempt");
             req->send(403, "text/plain", "Invalid Token");
+            return;
+        }
+        if (millis() - lastUnlockTime > LOCK_COOLDOWN_MS) {
+            setSystemState(LOCK_OPEN);
+            activityTimer = millis();
+            addLog("Opened via web");
+            rtcAddRecord(cachedTemp, cachedHum, getBatteryPct(), 2, 2);
+            if (mqttClient.connected()) {
+                mqttPublishEvent("web_open");
+                mqttPublishState(cachedTemp, cachedHum, getBatteryPct(), false);
+            }
+            req->send(200, "text/plain", "OK");
+        } else {
+            req->send(429, "text/plain", "Cooldown");
         }
     });
 
@@ -1259,7 +1953,8 @@ void setupServerRoutes() {
         int   rssi = WiFi.RSSI();
         const char* st = currentState == LOCK_OPEN     ? "LOCK_OPEN"
                        : currentState == READER_ACTIVE ? "READER_ACTIVE" : "IDLE";
-        String json = "{\"state\":\""; json += st;
+        String json; json.reserve(256);
+        json += "{\"state\":\"";   json += st;
         json += "\",\"temp\":";    json += isnan(cachedTemp) ? "-99" : String(cachedTemp, 1);
         json += ",\"hum\":";       json += isnan(cachedHum)  ? "-1"  : String(cachedHum,  1);
         json += ",\"battery\":";   json += dispPct;
@@ -1268,7 +1963,12 @@ void setupServerRoutes() {
         json += ",\"rssi\":";      json += rssi;
         json += ",\"uptime\":";    json += millis() / 1000;
         json += ",\"buffered\":";  json += rtcCount;
-        json += "}";
+        json += ",\"usb\":";       json += usbHostPresent() ? "true" : "false";
+        json += ",\"net\":\"";
+        json += apActive ? "ap" : (wifiMode == WM_CONNECTED ? "sta" : "off");
+        json += "\",\"ip\":\"";
+        json += apActive ? WiFi.softAPIP().toString() : WiFi.localIP().toString();
+        json += "\",\"fw\":\"" FW_VERSION "\"}";
         req->send(200, "application/json", json);
     });
 
@@ -1323,7 +2023,8 @@ void setupServerRoutes() {
 
     server.on("/api/graph", HTTP_GET, [](AsyncWebServerRequest *req) {
         if (!req->authenticate(www_username, www_password)) return req->requestAuthentication();
-        String json = "[";
+        String json; json.reserve(plogCount * 48 + 8);
+        json += "[";
         for (int i = 0; i < plogCount; i++) {
             int idx = plogGetIdx(i);
             PLogRecord& r = plogBuf[idx];
@@ -1344,6 +2045,124 @@ void setupServerRoutes() {
         if (!req->authenticate(www_username, www_password)) return req->requestAuthentication();
         req->send_P(200, "text/html", MONITOR_PAGE);
     });
+
+    // ── WiFi management ──────────────────────────────────────────────
+    server.on("/wifi", HTTP_GET, [](AsyncWebServerRequest *req) {
+        if (!req->authenticate(www_username, www_password)) return req->requestAuthentication();
+        activityTimer = millis();
+        req->send_P(200, "text/html", WIFI_PAGE);
+    });
+
+    server.on("/api/wifi/status", HTTP_GET, [](AsyncWebServerRequest *req) {
+        if (!req->authenticate(www_username, www_password)) return req->requestAuthentication();
+        activityTimer = millis();
+        String json; json.reserve(384);
+        json += "{\"mode\":\"";
+        json += (wifiMode == WM_CONNECTED)  ? "sta"
+              : (wifiMode == WM_CONNECTING) ? "connecting" : "off";
+        json += "\",\"ssid\":\"";  json += WiFi.SSID();
+        json += "\",\"ip\":\"";    json += WiFi.localIP().toString();
+        json += "\",\"rssi\":";    json += WiFi.RSSI();
+        json += ",\"ap\":";        json += apActive ? "true" : "false";
+        json += ",\"ap_clients\":"; json += apActive ? WiFi.softAPgetStationNum() : 0;
+        json += ",\"nets\":[";
+        for (int i = 0; i < wifiNetCount; i++) {
+            if (i) json += ",";
+            json += "\""; json += wifiNets[i].ssid; json += "\"";
+        }
+        json += "]}";
+        req->send(200, "application/json", json);
+    });
+
+    server.on("/api/wifi/scan", HTTP_GET, [](AsyncWebServerRequest *req) {
+        if (!req->authenticate(www_username, www_password)) return req->requestAuthentication();
+        activityTimer = millis();
+        if (req->hasParam("start")) {
+            uiScanUntil   = millis() + 15000;  // hold off the AP auto-scan
+            apScanPending = false;
+            WiFi.scanDelete();
+            WiFi.scanNetworks(true);   // async
+            req->send(200, "application/json", "{\"started\":true}");
+            return;
+        }
+        int n = WiFi.scanComplete();
+        if (n == WIFI_SCAN_RUNNING) {
+            req->send(200, "application/json", "{\"running\":true}");
+            return;
+        }
+        String json; json.reserve(n > 0 ? n * 64 : 32);
+        json += "{\"running\":false,\"nets\":[";
+        for (int i = 0; i < n; i++) {
+            if (i) json += ",";
+            json += "{\"ssid\":\"";  json += WiFi.SSID(i);
+            json += "\",\"rssi\":";  json += WiFi.RSSI(i);
+            json += ",\"sec\":";     json += (WiFi.encryptionType(i) != WIFI_AUTH_OPEN) ? "true" : "false";
+            json += "}";
+        }
+        json += "]}";
+        WiFi.scanDelete();
+        req->send(200, "application/json", json);
+    });
+
+    server.on("/api/wifi/add", HTTP_GET, [](AsyncWebServerRequest *req) {
+        if (!req->authenticate(www_username, www_password)) return req->requestAuthentication();
+        activityTimer = millis();
+        String s = req->hasParam("ssid") ? req->getParam("ssid")->value() : "";
+        String p = req->hasParam("pass") ? req->getParam("pass")->value() : "";
+        if (!s.length()) { req->send(400, "application/json", "{\"ok\":false,\"err\":\"no ssid\"}"); return; }
+        if (!wifiAddNet(s.c_str(), p.c_str())) {
+            req->send(200, "application/json", "{\"ok\":false,\"err\":\"list full (5)\"}");
+            return;
+        }
+        char buf[52]; snprintf(buf, sizeof(buf), "WiFi net saved: %s", s.c_str());
+        addLog(buf);
+        // Not connected (or in setup AP) — try the new network right away
+        if (wifiMode != WM_CONNECTED) wifiConnectStart(false);
+        req->send(200, "application/json", "{\"ok\":true}");
+    });
+
+    server.on("/api/wifi/del", HTTP_GET, [](AsyncWebServerRequest *req) {
+        if (!req->authenticate(www_username, www_password)) return req->requestAuthentication();
+        activityTimer = millis();
+        String s = req->hasParam("ssid") ? req->getParam("ssid")->value() : "";
+        bool ok = wifiDelNet(s.c_str());
+        req->send(200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
+    });
+
+    // ── OTA — web upload (Update.h, no global SSE/EventSource objects)
+    server.on("/update", HTTP_GET, [](AsyncWebServerRequest *req) {
+        if (!req->authenticate(www_username, www_password)) return req->requestAuthentication();
+        activityTimer = millis();
+        req->send_P(200, "text/html", OTA_PAGE);
+    });
+    server.on("/update", HTTP_POST,
+        [](AsyncWebServerRequest *req) {
+            bool ok = !Update.hasError();
+            AsyncWebServerResponse *resp = req->beginResponse(200, "text/plain",
+                ok ? "OK - rebooting" : "FAILED");
+            resp->addHeader("Connection", "close");
+            req->send(resp);
+            if (ok) { delay(300); ESP.restart(); }
+            else otaBusy = false;
+        },
+        [](AsyncWebServerRequest *req, String filename, size_t index, uint8_t *data, size_t len, bool final) {
+            if (!req->authenticate(www_username, www_password)) { req->send(401); return; }
+            if (!index) {
+                otaBusy = true;
+                servo.detach();               // never move the lock mid-update
+                Serial.printf("[OTA] Uploading: %s\n", filename.c_str());
+                if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) Update.printError(Serial);
+            }
+            if (len && Update.write(data, len) != len) Update.printError(Serial);
+            if (final) {
+                if (Update.end(true)) {
+                    prefs.putUChar("fw_try", 1);   // arm rollback watchdog
+                    Serial.printf("[OTA] Done: %u bytes\n", (unsigned)(index + len));
+                } else Update.printError(Serial);
+            }
+            activityTimer = millis();
+        }
+    );
 
     server.on("/calib", HTTP_GET, [](AsyncWebServerRequest *req) {
         if (!req->authenticate(www_username, www_password)) return req->requestAuthentication();
@@ -1437,6 +2256,71 @@ void setupServerRoutes() {
         json += "}";
         req->send(200, "application/json", json);
     });
+
+    // ── Settings ─────────────────────────────────────────────────────
+    server.on("/settings", HTTP_GET, [](AsyncWebServerRequest *req) {
+        if (!req->authenticate(www_username, www_password)) return req->requestAuthentication();
+        activityTimer = millis();
+        req->send_P(200, "text/html", SETTINGS_PAGE);
+    });
+
+    // NOTE: registered before /api/settings — the library prefix-matches,
+    // so the shorter route would otherwise swallow /api/settings/save
+    server.on("/api/settings/save", HTTP_GET, [](AsyncWebServerRequest *req) {
+        if (!req->authenticate(www_username, www_password)) return req->requestAuthentication();
+        activityTimer = millis();
+        bool mqttChanged = false;
+        auto has = [&](const char* p) {
+            return req->hasParam(p) && req->getParam(p)->value().length() > 0;
+        };
+        if (has("wu")) { strlcpy(www_username, req->getParam("wu")->value().c_str(), sizeof(www_username)); prefs.putString("s_wu", www_username); }
+        if (has("wp")) { strlcpy(www_password, req->getParam("wp")->value().c_str(), sizeof(www_password)); prefs.putString("s_wp", www_password); }
+        if (has("tk")) { strlcpy(api_token,    req->getParam("tk")->value().c_str(), sizeof(api_token));    prefs.putString("s_tk", api_token); }
+        if (has("ms")) { strlcpy(mqtt_server,  req->getParam("ms")->value().c_str(), sizeof(mqtt_server));  prefs.putString("s_ms", mqtt_server); mqttChanged = true; }
+        if (has("mu")) { strlcpy(mqtt_user,    req->getParam("mu")->value().c_str(), sizeof(mqtt_user));    prefs.putString("s_mu", mqtt_user);   mqttChanged = true; }
+        if (has("mk")) { strlcpy(mqtt_pass,    req->getParam("mk")->value().c_str(), sizeof(mqtt_pass));    prefs.putString("s_mk", mqtt_pass);   mqttChanged = true; }
+        if (has("mp")) {
+            int p = constrain(req->getParam("mp")->value().toInt(), 1, 65535);
+            if (p != mqtt_port) { mqtt_port = p; prefs.putInt("s_mp", p); mqttChanged = true; }
+        }
+        if (has("key")) {
+            uint32_t k = (uint32_t)req->getParam("key")->value().toInt();
+            if (k > 0) { masterKey = k; prefs.putUInt("s_key", k); }
+        }
+        if (mqttChanged) {
+            mqttClient.disconnect();
+            mqttClient.setServer(mqtt_server, mqtt_port);
+            mqttEverConnected = false;   // republish discovery on reconnect
+            lastMqttTryMs     = 0;
+        }
+        addLog("Settings updated");
+        req->send(200, "application/json", "{\"ok\":true}");
+    });
+
+    server.on("/api/settings", HTTP_GET, [](AsyncWebServerRequest *req) {
+        if (!req->authenticate(www_username, www_password)) return req->requestAuthentication();
+        String json; json.reserve(256);
+        json += "{\"wu\":\"";  json += www_username;
+        json += "\",\"tk\":\""; json += api_token;
+        json += "\",\"ms\":\""; json += mqtt_server;
+        json += "\",\"mp\":";   json += mqtt_port;
+        json += ",\"mu\":\"";   json += mqtt_user;
+        json += "\",\"key\":";  json += masterKey;
+        json += "}";
+        req->send(200, "application/json", json);
+    });
+
+    // Captive portal — while the setup AP is active, unknown URLs
+    // (phone connectivity probes) are redirected to the WiFi page
+    server.onNotFound([](AsyncWebServerRequest *req) {
+        if (apActive) {
+            AsyncWebServerResponse* r = req->beginResponse(302, "text/plain", "");
+            r->addHeader("Location", "http://192.168.4.1/wifi");
+            req->send(r);
+        } else {
+            req->send(404, "text/plain", "Not found");
+        }
+    });
 }
 
 // =====================================================================
@@ -1444,6 +2328,10 @@ void setupServerRoutes() {
 // =====================================================================
 void setup() {
     Serial.begin(115200);
+    // USB detection: drop the RX pull-up, add pulldown — line then reads
+    // HIGH only while the CH343 bridge is USB-powered (see usbHostPresent)
+    gpio_pullup_dis(UART_RX_GPIO);
+    gpio_pulldown_en(UART_RX_GPIO);
     delay(300);
     bootCount++;
     Serial.printf("[SYS] Boot #%u  (ESP32-S3-WROOM-1 N16R8)\n", bootCount);
@@ -1467,11 +2355,11 @@ void setup() {
         int bat = getBatteryPct();
         Serial.printf("[TIMER] T=%.1f BAT=%d\n", isnan(t) ? -99.0f : t, bat);
 
-        WiFi.mode(WIFI_STA);
-        wifiMulti.addAP(ssid, password);
-        unsigned long wStart = millis();
-        while (wifiMulti.run() != WL_CONNECTED && millis() - wStart < WIFI_CONNECT_TIMEOUT_MS)
-            delay(200);
+        prefs.begin("safe-app", false);
+        settingsLoad();
+        fwRollbackCheck();
+        wifiLoadNets();
+        wifiConnectBlocking(WIFI_CONNECT_TIMEOUT_MS);
 
         if (WiFi.status() == WL_CONNECTED) {
             Serial.printf("[WiFi] Connected: %s\n", WiFi.localIP().toString().c_str());
@@ -1502,6 +2390,7 @@ void setup() {
             Serial.println("[WiFi] Timeout — data buffered");
         }
 
+        fwMarkValid();   // completed report cycle = healthy firmware
         Serial.println("[SYS] Timer wake done — returning to deep sleep");
         ring.clear(); ring.show();
         rtc_gpio_init(SERVO_PIN_GPIO);
@@ -1530,82 +2419,44 @@ void setup() {
     attachInterrupt(digitalPinToInterrupt(D1_PIN), rfid_isr_d1, FALLING);
 
     prefs.begin("safe-app", false);
+    settingsLoad();
+    fwRollbackCheck();
     motorDirSwapped = prefs.getBool("m_dir", true);
-    Serial.printf("[SERVO] dirSwapped=%d\n", motorDirSwapped);
+    wifiLoadNets();
 
-    plogLoad();
-    plogAdd(NAN, (uint8_t)constrain(getBatteryPct(), 0, 100), 4); // boot event
-
-    // Release RTC hold on servo pin after touch wake
+    // Release RTC hold on servo pin BEFORE driving it
     if (wakeReason == WAKE_TOUCH) {
         rtc_gpio_hold_dis(SERVO_PIN_GPIO);
         rtc_gpio_deinit(SERVO_PIN_GPIO);
     }
 
-    ds18.begin();
-    ds18.setResolution(12);
-    ds18.setWaitForConversion(false);
-    ds18.requestTemperatures();
-    delay(800);
-    {
-        float _t = ds18.getTempCByIndex(0);
-        if (_t > -100.0f) {
-            cachedTemp = _t;
-            Serial.printf("[DS18B20] Init: %.2f°C on GPIO%d\n", _t, DHTPIN);
-        } else {
-            Serial.printf("[DS18B20] Init FAILED — check GPIO%d + 4.7kΩ to 3.3V\n", DHTPIN);
-        }
-    }
-    lastDHTRead = millis();
-
-    WiFi.mode(WIFI_STA);
-    wifiMulti.addAP(ssid, password);
-    for (int i = 0; i < 4 && wifiMulti.run() != WL_CONNECTED; i++) delay(500);
-
-    if (WiFi.status() == WL_CONNECTED) {
-        MDNS.begin("smartsafe");
-        Serial.printf("[WiFi] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
-        Serial.println("[WiFi] URL: http://smartsafe.local");
-
-        configTime(2 * 3600, 3600, "pool.ntp.org", "time.cloudflare.com");
-        time_t now = 0;
-        for (int i = 0; i < 25 && now < 1000000UL; i++) { delay(200); time(&now); }
-        if (now > 1000000UL) {
-            ntpEpoch  = (uint32_t)now;
-            ntpMillis = millis();
-            Serial.printf("[NTP] Synced: %lu\n", (unsigned long)now);
-        } else {
-            Serial.println("[NTP] Sync failed");
-        }
-
-        if (connectMQTT()) {
-            mqttPublishDiscovery();
-            mqttFlushBuffer();
-            mqttPublishState(cachedTemp, cachedHum, getBatteryPct(), true);
-        }
-    } else {
-        Serial.println("[WiFi] Connection FAILED");
-    }
-
-    setupServerRoutes();
-    server.begin();
-
-    setSystemState(IDLE);
-    activityTimer = millis();
-
-    if (wakeReason == WAKE_TOUCH) {
-        addLog("Touch wake — reader activated");
-        Serial.println("[SYS] Wake from touch — activating reader");
-    } else {
-        addLog("System started — reader active");
-        Serial.println("[SYS] Boot — activating reader");
-    }
     // Ensure door is locked on every startup/wake
     servoLock();
     servoDetachAt = millis() + SERVO_DETACH_MS;
 
+    // ── Reader is live HERE — everything below is non-blocking ──────
     setSystemState(READER_ACTIVE);
+    if (wakeReason == WAKE_TOUCH) {
+        addLog("Touch wake — reader activated");
+        Serial.printf("[SYS] Reader active %lums after boot\n", millis());
+    } else {
+        addLog("System started — reader active");
+    }
+
+    plogLoad();
+    plogAdd(NAN, (uint8_t)constrain(getBatteryPct(), 0, 100), 4); // boot event
+
+    // DS18B20 — async: first reading arrives in loop() ~1s from now
+    ds18.begin();
+    ds18.setResolution(12);
+    ds18.setWaitForConversion(false);
+    lastDHTRead = millis() - 4800;   // schedule first request in ~200ms
+
+    // WiFi — non-blocking connect; AP fallback only on touch wake
+    wifiConnectStart(wakeReason == WAKE_TOUCH);
+
     activityTimer = millis();
+    Serial.printf("[SYS] Setup done in %lums\n", millis());
 }
 
 // =====================================================================
@@ -1623,18 +2474,14 @@ void loop() {
         Serial.println("[SERVO] Detached");
     }
 
-    // MQTT keepalive
-    if (mqttClient.connected()) mqttClient.loop();
+    // Networking — connect FSM, NTP/MQTT, AP lifetime. All non-blocking.
+    wifiTick();
+    netTick();
+    apTick();
+    apScanTick();
 
-    // WiFi + MQTT reconnect every 60s when idle
-    static unsigned long lastNetCheck = 0;
-    if (currentState != READER_ACTIVE && millis() - lastNetCheck >= 60000) {
-        lastNetCheck = millis();
-        if (WiFi.status() != WL_CONNECTED) wifiMulti.run(2000);
-        if (WiFi.status() == WL_CONNECTED && !mqttClient.connected()) {
-            if (connectMQTT()) { mqttPublishDiscovery(); mqttFlushBuffer(); }
-        }
-    }
+    // New firmware survives 60s → mark valid (cancels OTA rollback)
+    if (fwPending && millis() > 60000) fwMarkValid();
 
     // DS18B20 — request every 5s, read result after 750ms (non-blocking)
     static bool ds18Pending = false;
@@ -1656,8 +2503,11 @@ void loop() {
         }
     }
 
-    // Battery sampling every 10s with per-sample outlier check
-    if (currentState != READER_ACTIVE && millis() - lastBatSampleMs >= BAT_SAMPLE_MS) {
+    // Battery sampling every 10s with per-sample outlier check.
+    // Paused while a USB host is attached — the divider then reads the
+    // 5V rail, not the battery.
+    if (currentState != READER_ACTIVE && !usbHostPresent() &&
+        millis() - lastBatSampleMs >= BAT_SAMPLE_MS) {
         lastBatSampleMs = millis();
         float v = takeBatReading();
         bool valid = true;
@@ -1701,6 +2551,8 @@ void loop() {
         activityTimer = millis();
         if (currentState == IDLE)               setSystemState(READER_ACTIVE);
         else if (currentState == READER_ACTIVE) stateTimer = millis();
+        // Touch is the trigger for the setup-AP fallback when offline
+        if (wifiMode == WM_OFF || wifiMode == WM_LOST) wifiConnectStart(true);
     }
     lastTouch = touch;
 
@@ -1777,8 +2629,10 @@ void loop() {
             mqttPublishState(cachedTemp, cachedHum, getBatteryPct(), true);
     }
 
-    // Idle timeout → deep sleep
-    if (currentState == IDLE && millis() - activityTimer > SLEEP_TIMEOUT_MS) {
+    // Idle timeout → deep sleep (never while OTA runs or setup AP is up)
+    if (currentState == IDLE && !otaBusy && !apActive &&
+        millis() - activityTimer > SLEEP_TIMEOUT_MS) {
+        fwMarkValid();   // made it to a clean sleep = healthy firmware
         addLog("Idle timeout — going to sleep");
         Serial.printf("[SYS] No activity for %lus — entering deep sleep\n",
                       (millis() - activityTimer) / 1000);
