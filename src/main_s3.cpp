@@ -315,6 +315,7 @@ int           batSampleIdx    = 0;
 float         batVAvg         = NAN;
 int           batPctAvg       = -1;
 unsigned long lastBatSampleMs = 0;
+float         batCalFactor    = 1.0f;  // divider-tolerance correction, set via /calib
 unsigned long lastMqttMs      = 0;
 unsigned long lastPlogMs      = 0;
 
@@ -351,7 +352,7 @@ static float takeBatReading() {
     float v[3];
     for (int i = 0; i < 3; i++) {
         delayMicroseconds(500);
-        v[i] = (analogReadMilliVolts(BAT_ADC) / 1000.0f) * 2.0f;
+        v[i] = (analogReadMilliVolts(BAT_ADC) / 1000.0f) * 2.0f * batCalFactor;
     }
     if (v[0] > v[1]) { float t = v[0]; v[0] = v[1]; v[1] = t; }
     if (v[1] > v[2]) { float t = v[1]; v[1] = v[2]; v[2] = t; }
@@ -362,7 +363,7 @@ static float takeBatReading() {
 BatteryInfo getBatteryInfo() {
     BatteryInfo b;
     b.raw  = analogRead(BAT_ADC);
-    b.vbat = (analogReadMilliVolts(BAT_ADC) / 1000.0f) * 2.0f;
+    b.vbat = (analogReadMilliVolts(BAT_ADC) / 1000.0f) * 2.0f * batCalFactor;
     b.pct  = constrain((int)((b.vbat - 3.0f) / 1.2f * 100.0f), 0, 100);
     return b;
 }
@@ -1373,7 +1374,7 @@ const char CALIB_PAGE[] PROGMEM = R"rawliteral(
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
-<title>Servo Calibration &#8212; SmartSafe</title>
+<title>Calibration &#8212; SmartSafe</title>
 <style>
 :root{--bg:#0a0a14;--s1:#13131f;--bd:#2a2a45;--ac:#6366f1;--gr:#10b981;--rd:#ef4444;--yw:#f59e0b;--tx:#e2e8f0;--tm:#64748b}
 *{box-sizing:border-box;margin:0;padding:0}
@@ -1405,7 +1406,7 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(
 </head>
 <body>
 <div class="hdr">
-  <div><h1>&#9881; Servo Calibration</h1></div>
+  <div><h1>&#9881; Calibration</h1></div>
   <a href="/" class="back">&#8592; Dashboard</a>
 </div>
 
@@ -1448,9 +1449,52 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(
   <div id="saveMsg"></div>
 </div>
 
+<div class="sec">Battery Voltage Calibration</div>
+<div class="card">
+  <div class="lbl">Measure the actual battery voltage with a multimeter, then enter it here to correct for divider/ADC tolerance</div>
+  <div class="row" style="align-items:center">
+    <span>Device reading</span>
+    <span class="mono" id="batLiveV" style="color:var(--yw)">--</span>
+  </div>
+  <div class="row">
+    <input type="number" step="0.01" id="batMeasured" placeholder="Multimeter volts, e.g. 4.18" style="flex:1;padding:11px;background:var(--bg);border:1px solid var(--bd);border-radius:8px;color:var(--tx);font-size:.9rem">
+  </div>
+  <div class="row">
+    <button class="btn ba" onclick="batCalibrate()">&#9989; Calibrate</button>
+    <button class="btn bstop" style="flex:0 0 90px" onclick="batReset()">Reset</button>
+  </div>
+  <div class="lbl" style="margin-top:8px">Current correction factor: <span class="mono" id="batFactor">--</span></div>
+  <div id="batMsg"></div>
+</div>
+
 <script>
 let unlockDir=null;
 async function api(p){try{const r=await fetch('/api/calib?'+p);return await r.json();}catch(e){return{ok:false};}}
+async function batRefresh(){
+  const r=await api('cmd=batread');
+  if(r&&r.ok){
+    document.getElementById('batLiveV').textContent=r.cal_v.toFixed(3)+'V';
+    document.getElementById('batFactor').textContent=r.factor.toFixed(4);
+  }
+}
+async function batCalibrate(){
+  const v=parseFloat(document.getElementById('batMeasured').value);
+  const el=document.getElementById('batMsg');
+  if(!v||v<2||v>5){el.innerHTML='<div class="msg msg-er">Enter a valid voltage (2&#8211;5V)</div>';return;}
+  const r=await api('cmd=batcal&v='+v);
+  el.innerHTML=r&&r.ok
+    ?'<div class="msg msg-ok">&#10003; Calibrated &#8212; factor '+r.factor.toFixed(4)+'</div>'
+    :'<div class="msg msg-er">&#10007; Calibration failed</div>';
+  batRefresh();
+}
+async function batReset(){
+  const r=await api('cmd=batcalreset');
+  const el=document.getElementById('batMsg');
+  el.innerHTML=r&&r.ok?'<div class="msg msg-ok">&#10003; Reset to factory (1.0000)</div>':'<div class="msg msg-er">&#10007; Reset failed</div>';
+  batRefresh();
+}
+batRefresh();
+setInterval(batRefresh,3000);
 function setDir(d){
   unlockDir=d;
   document.getElementById('dirChip').innerHTML='<span class="chip chip-ok">Position '+d+(d==='A'?' (0&deg;)':' (180&deg;)')+' = Open &#10003;</span>';
@@ -2196,6 +2240,33 @@ void setupServerRoutes() {
             Serial.printf("[CALIB] saved: dir=%s\n", dir.c_str());
             req->send(200, "application/json", "{\"ok\":true}");
 
+        } else if (cmd == "batread") {
+            float raw = (analogReadMilliVolts(BAT_ADC) / 1000.0f) * 2.0f; // uncalibrated
+            String json = "{\"ok\":true,\"raw_v\":" + String(raw, 3) +
+                          ",\"cal_v\":" + String(raw * batCalFactor, 3) +
+                          ",\"factor\":" + String(batCalFactor, 4) + "}";
+            req->send(200, "application/json", json);
+
+        } else if (cmd == "batcal") {
+            if (!req->hasParam("v")) { req->send(400, "application/json", "{\"ok\":false}"); return; }
+            float measured = req->getParam("v")->value().toFloat();
+            float raw = (analogReadMilliVolts(BAT_ADC) / 1000.0f) * 2.0f; // uncalibrated
+            if (measured <= 0.5f || raw <= 0.5f) {
+                req->send(400, "application/json", "{\"ok\":false}");
+                return;
+            }
+            batCalFactor = measured / raw;
+            prefs.putFloat("bat_cal", batCalFactor);
+            Serial.printf("[CALIB] battery: raw=%.3fV measured=%.3fV factor=%.4f\n", raw, measured, batCalFactor);
+            String json = "{\"ok\":true,\"factor\":" + String(batCalFactor, 4) + "}";
+            req->send(200, "application/json", json);
+
+        } else if (cmd == "batcalreset") {
+            batCalFactor = 1.0f;
+            prefs.putFloat("bat_cal", batCalFactor);
+            Serial.println("[CALIB] battery: factor reset to 1.0");
+            req->send(200, "application/json", "{\"ok\":true,\"factor\":1.0}");
+
         } else {
             req->send(400, "application/json", "{\"ok\":false}");
         }
@@ -2424,6 +2495,7 @@ void setup() {
     settingsLoad();
     fwRollbackCheck();
     motorDirSwapped = prefs.getBool("m_dir", true);
+    batCalFactor    = prefs.getFloat("bat_cal", 1.0f);
     wifiLoadNets();
 
     // Release RTC hold on servo pin BEFORE driving it
