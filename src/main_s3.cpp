@@ -17,7 +17,7 @@
 #include <esp_ota_ops.h>
 #include <driver/gpio.h>
 
-#define FW_VERSION "2.2.0"
+#define FW_VERSION "2.2.1"
 
 // =====================================================================
 // Pin Map — ESP32-S3-WROOM-1 N16R8
@@ -62,6 +62,8 @@
 #define BAT_SAMPLE_MS    10000UL
 #define BAT_SAMPLES      6
 #define BAT_OUTLIER_V    0.3f
+#define BAT_MIN_V        2.6f   // below any real single-cell LiPo
+#define BAT_MAX_V        4.35f  // above any real single-cell LiPo (incl. charge overshoot)
 #define MQTT_PERIODIC_MS (10UL * 60UL * 1000UL)
 
 // =====================================================================
@@ -991,7 +993,7 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:radial
     <div class="sub2" id="wRssi">-- dBm</div>
   </div>
   <div class="card bat-span">
-    <div class="lbl">&#128267; Battery</div>
+    <div class="lbl">&#128267; Battery <span id="usbBadge" style="display:none;color:var(--yw)">&#9889; USB</span></div>
     <div class="val" id="bVal">--%</div>
     <div class="bat-bar"><div class="bat-fill hi" id="bBar" style="width:0%"></div></div>
     <div id="bDbg" style="font-family:monospace;font-size:.62rem;color:var(--yw);margin-top:5px;line-height:1.5">raw: --<br>-- V</div>
@@ -1027,8 +1029,8 @@ async function fetchSt(){
     document.getElementById('bVal').textContent=b+'%';
     const bf=document.getElementById('bBar');bf.style.width=b+'%';
     bf.className='bat-fill '+(b>50?'hi':b>20?'md':'lo');
-    if(d.usb)document.getElementById('bDbg').innerHTML='&#9889; USB powered &#8212; battery reading paused';
-    else if(d.bat_raw!==undefined)document.getElementById('bDbg').innerHTML='raw: '+d.bat_raw+'<br>'+parseFloat(d.bat_v).toFixed(3)+' V';
+    document.getElementById('usbBadge').style.display=d.usb?'inline':'none';
+    if(d.bat_raw!==undefined)document.getElementById('bDbg').innerHTML='raw: '+d.bat_raw+'<br>'+parseFloat(d.bat_v).toFixed(3)+' V';
     document.getElementById('wRssi').textContent=d.rssi+' dBm';
     const wb=document.getElementById('wBars');
     wb.className='wifi '+(d.rssi>-60?'gd':d.rssi>-75?'md':'wk');
@@ -2503,15 +2505,23 @@ void loop() {
         }
     }
 
-    // Battery sampling every 10s with per-sample outlier check.
-    // Paused while a USB host is attached — the divider then reads the
-    // 5V rail, not the battery.
-    if (currentState != READER_ACTIVE && !usbHostPresent() &&
+    // Battery sampling every 10s with per-sample outlier + plausibility check.
+    // USB power (PC or a wall charger — electrically indistinguishable,
+    // both just supply VBUS) is NOT used to gate sampling: a wall charger
+    // legitimately shows a real, valid — if elevated — voltage while
+    // charging, and hiding it entirely made the feature worse than useless.
+    // Instead, implausible single-cell-LiPo values are rejected directly.
+    if (currentState != READER_ACTIVE &&
         millis() - lastBatSampleMs >= BAT_SAMPLE_MS) {
         lastBatSampleMs = millis();
         float v = takeBatReading();
-        bool valid = true;
-        if (!isnan(batVAvg) && fabsf(v - batVAvg) > BAT_OUTLIER_V) {
+        bool valid = (v >= BAT_MIN_V && v <= BAT_MAX_V);
+        if (!valid) {
+            Serial.printf("[BAT] %.3fV outside plausible range, resampling\n", v);
+            v = takeBatReading();
+            valid = (v >= BAT_MIN_V && v <= BAT_MAX_V);
+        }
+        if (valid && !isnan(batVAvg) && fabsf(v - batVAvg) > BAT_OUTLIER_V) {
             Serial.printf("[BAT] %.3fV deviates from avg %.3fV, resampling\n", v, batVAvg);
             v = takeBatReading();
             if (fabsf(v - batVAvg) > BAT_OUTLIER_V) {
@@ -2519,6 +2529,7 @@ void loop() {
                 valid = false;
             }
         }
+        if (!valid) Serial.printf("[BAT] Sample rejected: %.3fV\n", v);
         if (valid) {
             batSamples[batSampleIdx++] = v;
             Serial.printf("[BAT] Sample[%d] %.3fV\n", batSampleIdx - 1, v);
