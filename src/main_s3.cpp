@@ -17,7 +17,7 @@
 #include <esp_ota_ops.h>
 #include <driver/gpio.h>
 
-#define FW_VERSION "2.2.1"
+#define FW_VERSION "2.2.2"
 
 // =====================================================================
 // Pin Map — ESP32-S3-WROOM-1 N16R8
@@ -58,6 +58,8 @@
 #define AP_SSID                 "SBS"
 #define AP_TIMEOUT_MS           120000 // close AP if no client joined within 2 min
 #define MQTT_RETRY_MS           30000
+#define MQTT_FLUSH_SPACING_MS   1500   // gap between buffered-record publishes on reconnect,
+                                        // so HA's history doesn't compress them into one instant
 
 #define BAT_SAMPLE_MS    10000UL
 #define BAT_SAMPLES      6
@@ -134,8 +136,8 @@ void rtcAddRecord(float t, float h, uint8_t bat, uint8_t lockSt,
                   uint8_t evType, uint32_t cardCode = 0) {
     SensorRecord rec;
     rec.timestamp_s = millis() / 1000;
-    rec.temp        = isnan(t) ? -99.0f : t;
-    rec.hum         = isnan(h) ? -1.0f  : h;
+    rec.temp        = t;  // may be NaN — serialized as JSON null, never a fake number
+    rec.hum         = h;
     rec.battery_pct = bat;
     rec.lock_state  = lockSt;
     rec.event_type  = evType;
@@ -480,12 +482,13 @@ void mqttPublishDiscovery() {
 }
 
 void mqttPublishState(float temp, float hum, int bat, bool locked) {
+    char tempBuf[16], humBuf[16];
+    if (isnan(temp)) strcpy(tempBuf, "null"); else snprintf(tempBuf, sizeof(tempBuf), "%.1f", temp);
+    if (isnan(hum))  strcpy(humBuf,  "null"); else snprintf(humBuf,  sizeof(humBuf),  "%.0f", hum);
     char payload[256];
     snprintf(payload, sizeof(payload),
-        "{\"temp\":%.1f,\"hum\":%.0f,\"battery\":%d,\"locked\":%s,\"boot_count\":%u}",
-        isnan(temp) ? -99.0f : temp,
-        isnan(hum)  ? -1.0f  : hum,
-        bat, locked ? "true" : "false", bootCount);
+        "{\"temp\":%s,\"hum\":%s,\"battery\":%d,\"locked\":%s,\"boot_count\":%u}",
+        tempBuf, humBuf, bat, locked ? "true" : "false", bootCount);
     mqttClient.publish(MQTT_STATE_TOPIC, payload, true);
     Serial.printf("[MQTT] State: %s\n", payload);
 }
@@ -508,11 +511,14 @@ void mqttFlushBuffer() {
     for (int i = 0; i < rtcCount; i++) {
         int idx = rtcGetIdx(i);
         SensorRecord& rec = rtcBuffer[idx];
+        char tempBuf[16], humBuf[16];
+        if (isnan(rec.temp)) strcpy(tempBuf, "null"); else snprintf(tempBuf, sizeof(tempBuf), "%.1f", rec.temp);
+        if (isnan(rec.hum))  strcpy(humBuf,  "null"); else snprintf(humBuf,  sizeof(humBuf),  "%.0f", rec.hum);
         char payload[256];
         snprintf(payload, sizeof(payload),
-            "{\"temp\":%.1f,\"hum\":%.0f,\"battery\":%u,\"locked\":%s,"
+            "{\"temp\":%s,\"hum\":%s,\"battery\":%u,\"locked\":%s,"
             "\"boot_count\":%u,\"buffered\":true,\"ts\":%u}",
-            rec.temp, rec.hum, rec.battery_pct,
+            tempBuf, humBuf, rec.battery_pct,
             (rec.lock_state == 0) ? "true" : "false",
             bootCount, rec.timestamp_s);
         mqttClient.publish(MQTT_STATE_TOPIC, payload, true);
@@ -535,7 +541,7 @@ void mqttFlushBuffer() {
             mqttClient.publish(MQTT_EVENT_TOPIC, ev, false);
         }
         mqttClient.loop();
-        delay(10);
+        delay(MQTT_FLUSH_SPACING_MS);
     }
     rtcCount = 0;
     rtcHead  = 0;
@@ -2420,17 +2426,38 @@ void setup() {
 
     // ── Timer Wake: read sensors, report, go back to sleep ───────────
     if (wakeReason == WAKE_TIMER) {
+        // Load prefs (incl. battery calibration) BEFORE sampling — otherwise
+        // this periodic report ignores the saved calibration factor.
+        prefs.begin("safe-app", false);
+        settingsLoad();
+        fwRollbackCheck();
+        batCalFactor = prefs.getFloat("bat_cal", 1.0f);
+
         ds18.begin();
         ds18.requestTemperatures();
         delay(750);
         float t = ds18.getTempCByIndex(0);
-        if (t < -100.0f) t = NAN;
-        int bat = getBatteryPct();
+        if (t < -100.0f) {
+            // Single read failed — one retry before giving up (occasional
+            // OneWire glitch right after deep-sleep wake).
+            delay(50);
+            ds18.requestTemperatures();
+            delay(750);
+            t = ds18.getTempCByIndex(0);
+            if (t < -100.0f) t = NAN;
+        }
+
+        // Median-of-3 + plausibility check, same as the awake sampling
+        // pipeline — a single raw ADC sample here was producing spurious
+        // spikes (e.g. jumping to 100%) on this unattended report path.
+        float vbat = takeBatReading();
+        if (vbat < BAT_MIN_V || vbat > BAT_MAX_V) {
+            delay(50);
+            vbat = takeBatReading();
+        }
+        int bat = constrain((int)((vbat - 3.0f) / 1.2f * 100.0f), 0, 100);
         Serial.printf("[TIMER] T=%.1f BAT=%d\n", isnan(t) ? -99.0f : t, bat);
 
-        prefs.begin("safe-app", false);
-        settingsLoad();
-        fwRollbackCheck();
         wifiLoadNets();
         wifiConnectBlocking(WIFI_CONNECT_TIMEOUT_MS);
 
