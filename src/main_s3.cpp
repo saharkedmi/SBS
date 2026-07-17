@@ -17,7 +17,7 @@
 #include <esp_ota_ops.h>
 #include <driver/gpio.h>
 
-#define FW_VERSION "2.2.2"
+#define FW_VERSION "2.2.3"
 
 // =====================================================================
 // Pin Map — ESP32-S3-WROOM-1 N16R8
@@ -66,6 +66,8 @@
 #define BAT_OUTLIER_V    0.3f
 #define BAT_MIN_V        2.6f   // below any real single-cell LiPo
 #define BAT_MAX_V        4.35f  // above any real single-cell LiPo (incl. charge overshoot)
+#define TEMP_MIN_C       -20.0f // below any plausible indoor/ambient reading for this device
+#define TEMP_MAX_C        60.0f // above any plausible indoor/ambient reading for this device
 #define MQTT_PERIODIC_MS (10UL * 60UL * 1000UL)
 
 // =====================================================================
@@ -757,7 +759,13 @@ void onWifiConnected() {
     wifiLastGood = wifiCurIdx;
     Serial.printf("[WiFi] Connected: \"%s\"  IP %s\n",
                   WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
-    if (!mdnsStarted) { MDNS.begin("sbs"); mdnsStarted = true; }
+    // Restart mDNS on every (re)connect, not just the first — the ESP32
+    // responder can go silent after a WiFi drop/reconnect and never
+    // recover on its own, which is why sbs.local sometimes stops
+    // resolving even though the device is reachable by IP.
+    if (mdnsStarted) MDNS.end();
+    MDNS.begin("sbs");
+    mdnsStarted = true;
     configTime(2 * 3600, 3600, "pool.ntp.org", "time.cloudflare.com");
     mqttClient.setServer(mqtt_server, mqtt_port);
     mqttClient.setBufferSize(512);
@@ -893,16 +901,19 @@ void apTick() {
 
 // =====================================================================
 // Servo Control — angular servo on SERVO_PIN (GPIO 8)
-// A = 0 deg, B = 180 deg. motorDirSwapped: true -> A(0)=lock, B(180)=unlock
+// A = 0 deg, B = 90 deg. motorDirSwapped: true -> A(0)=lock, B(90)=unlock
 // =====================================================================
+#define SERVO_DEG_A 0
+#define SERVO_DEG_B 90
+
 void servoUnlock() {
-    int angle = motorDirSwapped ? 180 : 0;
+    int angle = motorDirSwapped ? SERVO_DEG_B : SERVO_DEG_A;
     Serial.printf("[SERVO] Unlock -> %d deg\n", angle);
     servo.attach(SERVO_PIN);
     servo.write(angle);
 }
 void servoLock() {
-    int angle = motorDirSwapped ? 0 : 180;
+    int angle = motorDirSwapped ? SERVO_DEG_A : SERVO_DEG_B;
     Serial.printf("[SERVO] Lock -> %d deg\n", angle);
     servo.attach(SERVO_PIN);
     servo.write(angle);
@@ -1422,7 +1433,7 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(
   <div class="lbl">Move servo to each endpoint to see which physically opens/closes the lock</div>
   <div class="row">
     <button class="btn ba" onclick="api('cmd=posA')">&#9654; Position A &mdash; 0&deg;</button>
-    <button class="btn bb" onclick="api('cmd=posB')">&#9654; Position B &mdash; 180&deg;</button>
+    <button class="btn bb" onclick="api('cmd=posB')">&#9654; Position B &mdash; 90&deg;</button>
     <button class="btn bstop" onclick="api('cmd=stop')" title="Detach">&#9632;</button>
   </div>
 </div>
@@ -1433,7 +1444,7 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(
   <div class="lbl">Select which position opens the lock</div>
   <div class="row">
     <button class="btn ba" onclick="setDir('A')">A (0&deg;) = Open &#10003;</button>
-    <button class="btn bb" onclick="setDir('B')">B (180&deg;) = Open &#10003;</button>
+    <button class="btn bb" onclick="setDir('B')">B (90&deg;) = Open &#10003;</button>
   </div>
   <div id="dirChip"><span class="chip chip-none">Not set yet</span></div>
 </div>
@@ -1503,7 +1514,7 @@ batRefresh();
 setInterval(batRefresh,3000);
 function setDir(d){
   unlockDir=d;
-  document.getElementById('dirChip').innerHTML='<span class="chip chip-ok">Position '+d+(d==='A'?' (0&deg;)':' (180&deg;)')+' = Open &#10003;</span>';
+  document.getElementById('dirChip').innerHTML='<span class="chip chip-ok">Position '+d+(d==='A'?' (0&deg;)':' (90&deg;)')+' = Open &#10003;</span>';
   document.getElementById('btnOpen').disabled=false;
   document.getElementById('btnClose').disabled=false;
   document.getElementById('btnSave').disabled=false;
@@ -1516,7 +1527,7 @@ async function save(){
   const r=await api('cmd=save&dir='+unlockDir);
   const el=document.getElementById('saveMsg');
   el.innerHTML=r&&r.ok
-    ?'<div class="msg msg-ok">&#10003; Saved! Position '+unlockDir+(unlockDir==='A'?' (0&deg;)':' (180&deg;)')+' opens the lock</div>'
+    ?'<div class="msg msg-ok">&#10003; Saved! Position '+unlockDir+(unlockDir==='A'?' (0&deg;)':' (90&deg;)')+' opens the lock</div>'
     :'<div class="msg msg-er">&#10007; Save failed</div>';
 }
 </script>
@@ -1956,6 +1967,9 @@ void setSystemState(SystemState newState) {
     } else if (newState == LOCK_OPEN) {
         plogAdd(cachedTemp, (uint8_t)constrain(batPctAvg >= 0 ? batPctAvg : getBatteryPct(), 0, 100), 1);
         servoUnlock();
+        // Detach once it reaches the open position — no need to keep
+        // driving the servo for the full LOCK_HOLD_MS hold.
+        servoDetachAt = millis() + SERVO_DETACH_MS;
         lockHoldStart = millis();
         digitalWrite(BOOST_12V_EN_PIN, LOW);
         lastUnlockTime = millis();
@@ -1982,6 +1996,10 @@ void setupServerRoutes() {
             return;
         }
         if (millis() - lastUnlockTime > LOCK_COOLDOWN_MS) {
+            // Same LED behavior as an RFID open — ledSetEffect() already
+            // enforces a settle pause when leaving LED_RAINBOW, so this is
+            // safe to call even while the reader is active.
+            ledSetEffect(LED_GREEN_FADE, LED_OFF, 500);
             setSystemState(LOCK_OPEN);
             activityTimer = millis();
             addLog("Opened via web");
@@ -2227,12 +2245,12 @@ void setupServerRoutes() {
 
         if (cmd == "posA") {
             servo.attach(SERVO_PIN);
-            servo.write(0);
+            servo.write(SERVO_DEG_A);
             req->send(200, "application/json", "{\"ok\":true}");
 
         } else if (cmd == "posB") {
             servo.attach(SERVO_PIN);
-            servo.write(180);
+            servo.write(SERVO_DEG_B);
             req->send(200, "application/json", "{\"ok\":true}");
 
         } else if (cmd == "stop") {
@@ -2437,15 +2455,17 @@ void setup() {
         ds18.requestTemperatures();
         delay(750);
         float t = ds18.getTempCByIndex(0);
-        if (t < -100.0f) {
-            // Single read failed — one retry before giving up (occasional
-            // OneWire glitch right after deep-sleep wake).
+        bool tempValid = (t > -100.0f) && (t >= TEMP_MIN_C && t <= TEMP_MAX_C);
+        if (!tempValid) {
+            // Read failed or implausible — one retry before giving up
+            // (occasional OneWire glitch right after deep-sleep wake).
             delay(50);
             ds18.requestTemperatures();
             delay(750);
             t = ds18.getTempCByIndex(0);
-            if (t < -100.0f) t = NAN;
+            tempValid = (t > -100.0f) && (t >= TEMP_MIN_C && t <= TEMP_MAX_C);
         }
+        if (!tempValid) t = NAN;
 
         // Median-of-3 + plausibility check, same as the awake sampling
         // pipeline — a single raw ADC sample here was producing spurious
@@ -2596,11 +2616,13 @@ void loop() {
         float t = ds18.getTempCByIndex(0);
         ds18Pending = false;
         lastDHTRead = millis();
-        if (t > -100.0f) {
+        if (t <= -100.0f) {
+            Serial.println("[DS18B20] Read FAILED");
+        } else if (t < TEMP_MIN_C || t > TEMP_MAX_C) {
+            Serial.printf("[DS18B20] %.2f°C outside plausible range, rejected\n", t);
+        } else {
             cachedTemp = t;
             Serial.printf("[DS18B20] %.2f°C\n", t);
-        } else {
-            Serial.println("[DS18B20] Read FAILED");
         }
     }
 
