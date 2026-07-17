@@ -17,7 +17,7 @@
 #include <esp_ota_ops.h>
 #include <driver/gpio.h>
 
-#define FW_VERSION "2.2.3"
+#define FW_VERSION "2.2.4"
 
 // =====================================================================
 // Pin Map — ESP32-S3-WROOM-1 N16R8
@@ -901,10 +901,13 @@ void apTick() {
 
 // =====================================================================
 // Servo Control — angular servo on SERVO_PIN (GPIO 8)
-// A = 0 deg, B = 90 deg. motorDirSwapped: true -> A(0)=lock, B(90)=unlock
+// A = 0 deg, B = 180 deg. motorDirSwapped: true -> A(0)=lock, B(180)=unlock
+// Reverted from 90 back to 180 — the mechanism needs the full swing to
+// fully seat; 90 left it straining against a hard stop indefinitely
+// after locking (servo.detach() alone doesn't stop a jammed mechanism).
 // =====================================================================
 #define SERVO_DEG_A 0
-#define SERVO_DEG_B 90
+#define SERVO_DEG_B 180
 
 void servoUnlock() {
     int angle = motorDirSwapped ? SERVO_DEG_B : SERVO_DEG_A;
@@ -1433,7 +1436,7 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(
   <div class="lbl">Move servo to each endpoint to see which physically opens/closes the lock</div>
   <div class="row">
     <button class="btn ba" onclick="api('cmd=posA')">&#9654; Position A &mdash; 0&deg;</button>
-    <button class="btn bb" onclick="api('cmd=posB')">&#9654; Position B &mdash; 90&deg;</button>
+    <button class="btn bb" onclick="api('cmd=posB')">&#9654; Position B &mdash; 180&deg;</button>
     <button class="btn bstop" onclick="api('cmd=stop')" title="Detach">&#9632;</button>
   </div>
 </div>
@@ -1444,7 +1447,7 @@ body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(
   <div class="lbl">Select which position opens the lock</div>
   <div class="row">
     <button class="btn ba" onclick="setDir('A')">A (0&deg;) = Open &#10003;</button>
-    <button class="btn bb" onclick="setDir('B')">B (90&deg;) = Open &#10003;</button>
+    <button class="btn bb" onclick="setDir('B')">B (180&deg;) = Open &#10003;</button>
   </div>
   <div id="dirChip"><span class="chip chip-none">Not set yet</span></div>
 </div>
@@ -1514,7 +1517,7 @@ batRefresh();
 setInterval(batRefresh,3000);
 function setDir(d){
   unlockDir=d;
-  document.getElementById('dirChip').innerHTML='<span class="chip chip-ok">Position '+d+(d==='A'?' (0&deg;)':' (90&deg;)')+' = Open &#10003;</span>';
+  document.getElementById('dirChip').innerHTML='<span class="chip chip-ok">Position '+d+(d==='A'?' (0&deg;)':' (180&deg;)')+' = Open &#10003;</span>';
   document.getElementById('btnOpen').disabled=false;
   document.getElementById('btnClose').disabled=false;
   document.getElementById('btnSave').disabled=false;
@@ -1527,7 +1530,7 @@ async function save(){
   const r=await api('cmd=save&dir='+unlockDir);
   const el=document.getElementById('saveMsg');
   el.innerHTML=r&&r.ok
-    ?'<div class="msg msg-ok">&#10003; Saved! Position '+unlockDir+(unlockDir==='A'?' (0&deg;)':' (90&deg;)')+' opens the lock</div>'
+    ?'<div class="msg msg-ok">&#10003; Saved! Position '+unlockDir+(unlockDir==='A'?' (0&deg;)':' (180&deg;)')+' opens the lock</div>'
     :'<div class="msg msg-er">&#10007; Save failed</div>';
 }
 </script>
